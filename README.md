@@ -1,0 +1,1 @@
+# AF_PLUMED_GROMACS_autoinstaller
