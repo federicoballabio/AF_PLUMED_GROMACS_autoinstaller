@@ -21,10 +21,10 @@
 #     be reused and the new run can continue directly with the gromacs stage.
 #
 # Quick start:
-#   ./af_plumed_gmx_build_v12.sh --dir $HOME/software --name myenv
-#   ./af_plumed_gmx_build_v12.sh --dir $HOME/software --name myenv --arch 90 -j 16 \
+#   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv
+#   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --arch 90 -j 16 \
 #                            --write-bashrc
-#   ./af_plumed_gmx_build_v12.sh --dir $HOME/software --name myenv --from gromacs
+#   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --from gromacs
 #
 # See --help for all options.
 ###############################################################################
@@ -34,7 +34,7 @@ umask 022
 
 SCRIPT_NAME="$(basename "${0}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-SCRIPT_VERSION="3.5-gmx-auto-v12-scriptdir-patch"
+SCRIPT_VERSION="4.8-gmx-auto-v25-arrayfire-libdir-postflight"
 
 ###############################################################################
 # Component versions (override from the environment if needed, e.g.
@@ -148,7 +148,7 @@ section() {
 ###############################################################################
 usage() {
   cat <<'EOF'
-Usage: af_plumed_gmx_build_v12.sh --dir <parent-dir> [options]
+Usage: af_plumed_gmx_build.sh --dir <parent-dir> [options]
 
 Builds OpenMPI, FFTW, Boost, fmt, spdlog, ArrayFire (CUDA), PLUMED and a
 PLUMED-patched GROMACS installation into <parent-dir>/<name>, with
@@ -167,8 +167,8 @@ Common options:
   --cuda <path>         CUDA toolkit root (must contain bin/nvcc). If omitted,
                         the toolkit is auto-detected (env vars, PATH, then common
                         locations such as /usr/local/cuda*).
-  --arch <archs>        CUDA compute architecture(s), e.g. 80 or "70;80;90".
-                        Default: 80.
+  --arch <archs>        CUDA compute architecture(s), e.g. 80, 86, 90, or 120.
+                        Default: 80. For RTX 50-series / Blackwell, use 120.
   -j, --jobs <n>        Parallel build jobs. Default: nproc.
   --plumed-ref <ref>    Git branch/tag/commit for PLUMED. Default: master.
   --gromacs-version <v> GROMACS version, or auto. Default: auto.
@@ -231,10 +231,10 @@ Selected environment overrides (export before running):
   GMX_SIMD MARCH AUTO_REPAIR CUDA_SHIM_DIR CUDA_EXTRA_INCLUDE_DIRS CUDA_EXTRA_LIB_DIRS
 
 Examples:
-  ./af_plumed_gmx_build_v12.sh --dir $HOME/software --name myenv
-  ./af_plumed_gmx_build_v12.sh --dir $HOME/sw --name plumed_a100 --arch 80 -j 32 --write-bashrc
-  ./af_plumed_gmx_build_v12.sh --dir $HOME/software --name myenv --from gromacs    # continue after PLUMED
-  ./af_plumed_gmx_build_v12.sh --dir $HOME/software --name myenv --status
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv
+  ./af_plumed_gmx_build.sh --dir $HOME/sw --name plumed_a100 --arch 80 -j 32 --write-bashrc
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --from gromacs    # continue after PLUMED
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --status
 EOF
 }
 
@@ -453,6 +453,9 @@ load your CUDA module, or install CUDA in a standard location."
     || die "Found nvcc at ${CUDA_HOME}/bin/nvcc but could not parse its version."
   export CUDA_HOME
   export CUDA_ROOT="${CUDA_HOME}"
+  if [[ -x "${CUDA_HOME}/bin/nvcc" ]]; then
+    export CUDACXX="${CUDA_HOME}/bin/nvcc"
+  fi
 }
 
 ###############################################################################
@@ -646,7 +649,7 @@ link_cuda_headers_into_shim() {
       esac
     done
     shopt -u nullglob
-    for sub in crt cooperative_groups nv; do
+    for sub in crt cooperative_groups nv cccl; do
       [[ -d "${d}/${sub}" ]] && ln -sfn "${d}/${sub}" "${shim}/include/${sub}"
     done
   done < <(cuda_candidate_include_dirs | unique_lines)
@@ -711,6 +714,7 @@ create_or_update_cuda_shim() {
   CUDA_HOME="$(abspath "${shim}")"
   CUDA_VERSION="$(get_cuda_version "${CUDA_HOME}/bin/nvcc")"
   export CUDA_HOME CUDA_ROOT="${CUDA_HOME}"
+  export CUDACXX="${CUDA_HOME}/bin/nvcc"
 }
 
 ensure_cuda_development_layout() {
@@ -801,6 +805,7 @@ On HPC, try 'module load' for the relevant compilers/cmake/git, or ask your admi
   # CUDA sanity.
   if "${CUDA_HOME}/bin/nvcc" --version >/dev/null 2>&1; then
     ok "CUDA ${CUDA_VERSION} at ${CUDA_HOME}."
+    export CUDACXX="${CUDA_HOME}/bin/nvcc"
   else
     _pf_fail "nvcc at ${CUDA_HOME}/bin/nvcc is not runnable."
   fi
@@ -883,8 +888,13 @@ setup_environment() {
 
   # Prepend our trees so they win, but keep the existing PATH/library paths so
   # HPC module-provided compilers and tools remain available.
+  # Make CMake CUDA-language discovery deterministic on HPC nodes where nvcc is
+  # not exposed through the default environment.
+  if [[ -x "${CUDA_HOME}/bin/nvcc" ]]; then
+    export CUDACXX="${CUDA_HOME}/bin/nvcc"
+  fi
   export PATH="${GMX_ROOT}/bin:${PLUMED_ROOT}/bin:${MPI_ROOT}/bin:${CUDA_HOME}/bin:${PATH}"
-  export LD_LIBRARY_PATH="${GMX_ROOT}/lib:${GMX_ROOT}/lib64:${PLUMED_ROOT}/lib:${AF_ROOT}/lib:${FFTW_ROOT}/lib:${BOOST_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${SPDLOG_ROOT}/lib:${SPDLOG_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+  export LD_LIBRARY_PATH="${GMX_ROOT}/lib:${GMX_ROOT}/lib64:${PLUMED_ROOT}/lib:${AF_ROOT}/lib:${AF_ROOT}/lib64:${FFTW_ROOT}/lib:${BOOST_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${SPDLOG_ROOT}/lib:${SPDLOG_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
   export PKG_CONFIG_PATH="${GMX_ROOT}/lib/pkgconfig:${GMX_ROOT}/lib64/pkgconfig:${FFTW_ROOT}/lib/pkgconfig:${FMT_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
   export CMAKE_PREFIX_PATH="${GMX_ROOT}:${PLUMED_ROOT}:${AF_ROOT}:${FFTW_ROOT}:${BOOST_ROOT}:${FMT_ROOT}:${SPDLOG_ROOT}:${MPI_ROOT}:${CUDA_HOME}:${CMAKE_PREFIX_PATH:-}"
   export BOOST_INCLUDEDIR="${BOOST_ROOT}/include"
@@ -1102,6 +1112,205 @@ stage_arrayfire() {
     fi
   fi
 
+  # CUDA 13 moved Thrust/CCCL headers under include/cccl and no longer exposes
+  # some old internal Thrust headers used by ArrayFire 3.9.0. ArrayFire only
+  # needs the public CUDA execution-policy header here, so replace the removed
+  # internal include with the public one. This is intentionally narrow and is
+  # applied only when the source contains the legacy include.
+  local af_thrust_utils="src/backend/cuda/thrust_utils.hpp"
+  if [[ -f "${af_thrust_utils}" ]]; then
+    if grep -q 'thrust/system/cuda/detail/par.h' "${af_thrust_utils}"; then
+      info "Patching ArrayFire thrust_utils.hpp for CUDA 13/CCCL Thrust header layout."
+      sed -i 's#<thrust/system/cuda/detail/par.h>#<thrust/system/cuda/execution_policy.h>#' "${af_thrust_utils}"
+    fi
+  fi
+
+  # CUDA 13/CCCL removed the legacy internal header
+  # <thrust/system/cuda/detail/par.h>. ArrayFire 3.9.0 uses it in more than
+  # one CUDA backend file, so patch any remaining occurrences after the
+  # dedicated thrust_utils.hpp compatibility edit above. The replacement is the
+  # public execution policy header, which is the same replacement already proven
+  # for thrust_utils.hpp on this CUDA 13 build.
+  local af_legacy_thrust_files
+  af_legacy_thrust_files="$(grep -RIl 'thrust/system/cuda/detail/par.h' src/backend/cuda 2>/dev/null || true)"
+  if [[ -n "${af_legacy_thrust_files}" ]]; then
+    info "Patching remaining ArrayFire legacy Thrust par.h includes for CUDA 13/CCCL."
+    while IFS= read -r af_legacy_file; do
+      [[ -n "${af_legacy_file}" ]] || continue
+      info "  ${af_legacy_file}"
+      sed -i 's#<thrust/system/cuda/detail/par.h>#<thrust/system/cuda/execution_policy.h>#g' "${af_legacy_file}"
+    done <<< "${af_legacy_thrust_files}"
+  fi
+
+  # CUDA 13/CCCL removed/changed visibility of a few legacy Thrust adapter
+  # APIs used by ArrayFire 3.9.0.  The inheritance from thrust::unary_function
+  # is only a deprecated typedef-style adapter and is not needed for the functor
+  # itself, while thrust::distance simply needs its public header.
+  local af_regions_hpp="src/backend/cuda/kernel/regions.hpp"
+  if [[ -f "${af_regions_hpp}" ]]; then
+    if grep -q 'thrust::unary_function' "${af_regions_hpp}"; then
+      info "Patching ArrayFire regions.hpp for CUDA 13/CCCL thrust::unary_function removal."
+      python3 - "${af_regions_hpp}" <<'PYEOF'
+import pathlib
+import re
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+new_text = re.sub(
+    r'\s*:\s*public\s+thrust::unary_function\s*<\s*T\s*,\s*T\s*>',
+    '',
+    text,
+)
+if new_text == text:
+    raise SystemExit("Could not patch thrust::unary_function in regions.hpp")
+path.write_text(new_text)
+PYEOF
+    fi
+  fi
+
+  local af_set_cu="src/backend/cuda/set.cu"
+  if [[ -f "${af_set_cu}" ]]; then
+    if grep -q 'thrust::distance' "${af_set_cu}"        && ! grep -q '#include <thrust/distance.h>' "${af_set_cu}"; then
+      info "Patching ArrayFire set.cu to include <thrust/distance.h> for CUDA 13/CCCL."
+      python3 - "${af_set_cu}" <<'PYEOF'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+include = '#include <thrust/distance.h>\n'
+if include in text:
+    sys.exit(0)
+lines = text.splitlines(True)
+insert_at = 0
+for i, line in enumerate(lines):
+    if line.startswith('#include '):
+        insert_at = i + 1
+lines.insert(insert_at, include)
+path.write_text(''.join(lines))
+PYEOF
+    fi
+  fi
+
+  # CUDA 13 removed the legacy cudaDeviceProp::clockRate field from
+  # cudaDeviceProp. ArrayFire 3.9.0 only uses it to estimate a device GFLOP/s
+  # score for sorting CUDA devices. Query the same value via the public runtime
+  # attribute API on CUDA 13+, while preserving the old field path for older
+  # toolkits.
+  local af_device_manager_cpp="src/backend/cuda/device_manager.cpp"
+  if [[ -f "${af_device_manager_cpp}" ]]; then
+    if grep -q 'dev\.prop\.clockRate' "${af_device_manager_cpp}"; then
+      info "Patching ArrayFire device_manager.cpp for CUDA 13 cudaDeviceProp::clockRate removal."
+      python3 - "${af_device_manager_cpp}" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+if "af_cuda_clock_rate_khz" in text:
+    sys.exit(0)
+lines = text.splitlines(True)
+out = []
+inserted = False
+replaced = False
+for line in lines:
+    if (not inserted) and "dev.flops" in line:
+        indent = line[: len(line) - len(line.lstrip())]
+        out.extend([
+            f"{indent}int af_cuda_clock_rate_khz = 0;\n",
+            f"{indent}#if defined(CUDA_VERSION) && CUDA_VERSION >= 13000\n",
+            f"{indent}CUDA_CHECK(cudaDeviceGetAttribute(&af_cuda_clock_rate_khz,\n",
+            f"{indent}                                     cudaDevAttrClockRate, i));\n",
+            f"{indent}#else\n",
+            f"{indent}af_cuda_clock_rate_khz = dev.prop.clockRate;\n",
+            f"{indent}#endif\n",
+        ])
+        inserted = True
+    if "dev.prop.clockRate" in line:
+        line = line.replace("dev.prop.clockRate", "af_cuda_clock_rate_khz")
+        replaced = True
+    out.append(line)
+new_text = ''.join(out)
+if not inserted:
+    raise SystemExit("Could not find dev.flops assignment in device_manager.cpp")
+if not replaced:
+    raise SystemExit("Could not replace dev.prop.clockRate in device_manager.cpp")
+path.write_text(new_text)
+PYEOF
+    fi
+  fi
+
+  # Note: v22 had an optional CUDA 13/Blackwell runtime-table patch here.
+  # It was removed in v23 because ArrayFire 3.9.0 source variants differ in
+  # table names. The confirmed required CUDA 13 fix is the clock-rate patch above.
+
+  # CUDA 13/CCCL no longer makes thrust::pair visible through the headers that
+  # ArrayFire 3.9.0 includes indirectly. The type is still available when the
+  # public <thrust/pair.h> header is included. Keep ArrayFire's code unchanged
+  # and add the missing public include to its custom Thrust policy header.
+  local af_thrust_policy="src/backend/cuda/ThrustArrayFirePolicy.hpp"
+  if [[ -f "${af_thrust_policy}" ]]; then
+    if grep -q 'thrust::pair' "${af_thrust_policy}" \
+       && ! grep -q '#include <thrust/pair.h>' "${af_thrust_policy}"; then
+      info "Patching ArrayFire ThrustArrayFirePolicy.hpp to include <thrust/pair.h> for CUDA 13/CCCL."
+      sed -i '/#include <thrust\/memory.h>/a #include <thrust/pair.h>' "${af_thrust_policy}"
+    fi
+  fi
+
+  # CUDA 13 removes/does not expose a few legacy cuFFT result enum values
+  # that ArrayFire 3.9.0 still lists in its error-string switch. These values
+  # are only used for human-readable diagnostics.  Patch the whole diagnostic
+  # function rather than deleting individual case labels: this preserves the
+  # surrounding source structure and avoids brittle sed range mistakes.
+  local af_cufft="src/backend/cuda/cufft.cu"
+  if [[ -f "${af_cufft}" ]]; then
+    if grep -Eq 'CUFFT_INCOMPLETE_PARAMETER_LIST|CUFFT_PARSE_ERROR|CUFFT_LICENSE_ERROR' "${af_cufft}"; then
+      info "Patching ArrayFire cufft.cu for CUDA 13 legacy cuFFT enum compatibility."
+      python3 - "${af_cufft}" <<'PYEOF'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+replacement = '''const char *_cufftGetResultString(cufftResult res) {
+    switch (res) {
+        case CUFFT_SUCCESS: return "cuFFT: success";
+        case CUFFT_INVALID_PLAN: return "cuFFT: invalid plan handle passed";
+        case CUFFT_ALLOC_FAILED: return "cuFFT: resources allocation failed";
+        case CUFFT_INVALID_TYPE: return "cuFFT: invalid type (deprecated)";
+        case CUFFT_INVALID_VALUE:
+            return "cuFFT: invalid parameters passed to cuFFT API";
+        case CUFFT_INTERNAL_ERROR:
+            return "cuFFT: internal error detected using cuFFT";
+        case CUFFT_EXEC_FAILED: return "cuFFT: FFT execution failed";
+        case CUFFT_SETUP_FAILED: return "cuFFT: library initialization failed";
+        case CUFFT_INVALID_SIZE: return "cuFFT: invalid size parameters passed";
+        case CUFFT_UNALIGNED_DATA: return "cuFFT: unaligned data (deprecated)";
+        case CUFFT_INVALID_DEVICE:
+            return "cuFFT: plan execution different than plan creation";
+        case CUFFT_NO_WORKSPACE: return "cuFFT: no workspace provided";
+        case CUFFT_NOT_IMPLEMENTED: return "cuFFT: not implemented";
+#if CUDA_VERSION >= 8000
+        case CUFFT_NOT_SUPPORTED: return "cuFFT: not supported";
+#endif
+    }
+
+    return "cuFFT: unknown error";
+}'''
+pattern = re.compile(
+    r'const char\s+\*_cufftGetResultString\s*\(\s*cufftResult\s+res\s*\)\s*\{.*?\n\}',
+    re.S,
+)
+new_text, n = pattern.subn(replacement, text, count=1)
+if n != 1:
+    raise SystemExit("Could not locate exactly one _cufftGetResultString function in cufft.cu")
+if new_text.count("{") != new_text.count("}"):
+    raise SystemExit("Refusing to write cufft.cu: brace count mismatch after patch")
+path.write_text(new_text)
+PYEOF
+    fi
+  fi
+
   rm -rf build_cuda && mkdir -p build_cuda && cd build_cuda
 
   unset PKG_CONFIG_LIBDIR 2>/dev/null || true
@@ -1122,14 +1331,28 @@ stage_arrayfire() {
   FMT_CMAKE_DIR="$(dirname "${FMT_CMAKE_FILE}")"
   info "Using fmt CMake package: ${FMT_CMAKE_FILE}"
 
+  local cuda_cccl_args=()
+  if [[ -d "${CUDA_HOME}/include/cccl" ]]; then
+    info "CUDA CCCL headers detected; adding ${CUDA_HOME}/include/cccl to ArrayFire C++/CUDA include paths."
+    export CPATH="${CUDA_HOME}/include/cccl:${CPATH:-}"
+    export CPLUS_INCLUDE_PATH="${CUDA_HOME}/include/cccl:${CPLUS_INCLUDE_PATH:-}"
+    cuda_cccl_args+=("-DCMAKE_CUDA_FLAGS=-I${CUDA_HOME}/include/cccl ${CMAKE_CUDA_FLAGS:-}")
+    cuda_cccl_args+=("-DCMAKE_CXX_FLAGS=-I${CUDA_HOME}/include/cccl ${CMAKE_CXX_FLAGS:-}")
+  fi
+
   mapfile -t cmake_iso < <(cmake_common_isolation_args)
   cmake .. \
     -DCMAKE_INSTALL_PREFIX="${AF_ROOT}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+    -DCMAKE_CUDA_STANDARD=17 \
+    -DCMAKE_CUDA_STANDARD_REQUIRED=ON \
     -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+    -DCMAKE_CUDA_COMPILER="${CUDACXX:-${CUDA_HOME}/bin/nvcc}" \
     -DCMAKE_PREFIX_PATH="${FMT_ROOT};${FFTW_ROOT};${BOOST_ROOT};${SPDLOG_ROOT};${CUDA_HOME}" \
     -DCMAKE_BUILD_RPATH="${FMT_ROOT}/lib;${FMT_ROOT}/lib64;${FFTW_ROOT}/lib;${CUDA_HOME}/lib64;${CUDA_HOME}/targets/x86_64-linux/lib" \
-    -DCMAKE_INSTALL_RPATH="${FMT_ROOT}/lib;${FMT_ROOT}/lib64;${AF_ROOT}/lib;${FFTW_ROOT}/lib;${CUDA_HOME}/lib64;${CUDA_HOME}/targets/x86_64-linux/lib" \
+    -DCMAKE_INSTALL_RPATH="${FMT_ROOT}/lib;${FMT_ROOT}/lib64;${AF_ROOT}/lib;${AF_ROOT}/lib64;${FFTW_ROOT}/lib;${CUDA_HOME}/lib64;${CUDA_HOME}/targets/x86_64-linux/lib" \
     -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
     -DAF_BUILD_OPENCL=OFF \
     -DAF_BUILD_CPU=OFF \
@@ -1146,6 +1369,7 @@ stage_arrayfire() {
     -DNVPRUNE="${CUDA_HOME}/bin/nvprune" \
     -Dfmt_DIR="${FMT_CMAKE_DIR}" \
     ${SPDLOG_CMAKE_DIR:+-Dspdlog_DIR="${SPDLOG_CMAKE_DIR}"} \
+    "${cuda_cccl_args[@]}" \
     "${cmake_iso[@]}"
 
   info "ArrayFire FFTW cache entries:"
@@ -1155,8 +1379,12 @@ stage_arrayfire() {
 
   [[ -f "${AF_ROOT}/include/arrayfire.h" ]] \
     || die "arrayfire.h not found after install."
-  assert_no_missing_libs "${AF_ROOT}/lib/libafcuda.so" "ArrayFire CUDA library"
-  ok "ArrayFire installed at ${AF_ROOT}"
+  local af_installed_libdir="${AF_ROOT}/lib"
+  [[ -e "${af_installed_libdir}/libafcuda.so" ]] || af_installed_libdir="${AF_ROOT}/lib64"
+  [[ -e "${af_installed_libdir}/libafcuda.so" ]] \
+    || die "ArrayFire CUDA library not found under ${AF_ROOT}/lib or ${AF_ROOT}/lib64."
+  assert_no_missing_libs "${af_installed_libdir}/libafcuda.so" "ArrayFire CUDA library"
+  ok "ArrayFire installed at ${AF_ROOT} (${af_installed_libdir})"
   mark_stage_done arrayfire
 }
 
@@ -1355,7 +1583,7 @@ stage_plumed() {
   PLUMED_KERNEL="${PLUMED_ROOT}/lib/libplumedKernel.so"
   mkdir -p "${PLUMED_ROOT}"
   export PATH="${MPI_ROOT}/bin:${CUDA_HOME}/bin:${PATH}"
-  export LD_LIBRARY_PATH="${AF_ROOT}/lib:${FFTW_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+  export LD_LIBRARY_PATH="${AF_ROOT}/lib:${AF_ROOT}/lib64:${FFTW_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
   unset PKG_CONFIG_LIBDIR 2>/dev/null || true
   export PKG_CONFIG_PATH="${FFTW_ROOT}/lib/pkgconfig:${FMT_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
   local plumed_python_config=()
@@ -1379,7 +1607,66 @@ stage_plumed() {
   make distclean 2>/dev/null || true
   apply_plumed_local_patches "${plumed_src}"
 
-  ./configure \
+  # PLUMED's configure check for ArrayFire is easy to miss: without an
+  # explicit LIBS value it may find arrayfire.h but fail the af_is_double link
+  # test, then silently continue without __PLUMED_HAS_ARRAYFIRE.  For SAXS this
+  # is fatal, so first prove a small program can link against the installed
+  # ArrayFire libraries and then pass exactly those libraries to configure.
+  local af_libdir="${AF_ROOT}/lib"
+  [[ -d "${af_libdir}" ]] || af_libdir="${AF_ROOT}/lib64"
+  [[ -d "${af_libdir}" ]] || die "ArrayFire library directory not found under ${AF_ROOT}"
+  [[ -f "${af_libdir}/libafcuda.so" ]] || die "ArrayFire CUDA library not found: ${af_libdir}/libafcuda.so"
+
+  local af_probe_src="${plumed_src}/arrayfire_link_probe.cpp"
+  local af_probe_bin="${plumed_src}/arrayfire_link_probe.exe"
+  cat > "${af_probe_src}" <<'EOF_AF_LINK_PROBE'
+#include <arrayfire.h>
+int main() {
+    (void)&af_is_double;
+    return 0;
+}
+EOF_AF_LINK_PROBE
+
+  local plumed_cppflags="-I${AF_ROOT}/include -I${FFTW_ROOT}/include -I${CUDA_HOME}/include -I${CUDA_HOME}/targets/x86_64-linux/include"
+  local plumed_ldflags="-L${af_libdir} -Wl,-rpath,${af_libdir} -L${FFTW_ROOT}/lib -Wl,-rpath,${FFTW_ROOT}/lib -L${FMT_ROOT}/lib -Wl,-rpath,${FMT_ROOT}/lib -L${FMT_ROOT}/lib64 -Wl,-rpath,${FMT_ROOT}/lib64 -L${MPI_ROOT}/lib -Wl,-rpath,${MPI_ROOT}/lib -L${CUDA_HOME}/lib64 -Wl,-rpath,${CUDA_HOME}/lib64 -L${CUDA_HOME}/targets/x86_64-linux/lib -Wl,-rpath,${CUDA_HOME}/targets/x86_64-linux/lib"
+  local arrayfire_libs=""
+  local candidate_libs
+  local af_link_log="${plumed_src}/arrayfire_link_probe.log"
+  : > "${af_link_log}"
+  for candidate_libs in \
+      "-lafcuda -laf -lstdc++" \
+      "-laf -lafcuda -lstdc++" \
+      "-lafcuda -lstdc++" \
+      "-laf -lstdc++"; do
+    info "Testing PLUMED ArrayFire link flags: ${candidate_libs}"
+    if env LD_LIBRARY_PATH="${af_libdir}:${LD_LIBRARY_PATH:-}" \
+      "${MPI_ROOT}/bin/mpicxx" ${plumed_cppflags} "${af_probe_src}" \
+      ${plumed_ldflags} ${candidate_libs} -o "${af_probe_bin}" \
+      >> "${af_link_log}" 2>&1; then
+      arrayfire_libs="${candidate_libs}"
+      break
+    fi
+  done
+
+  if [[ -z "${arrayfire_libs}" ]]; then
+    warn "PLUMED ArrayFire link probe failed. Last link output:"
+    tail -n 120 "${af_link_log}" || true
+    warn "Installed ArrayFire libraries:"
+    ls -lh "${af_libdir}"/libaf*.so* 2>/dev/null || true
+    if command -v nm >/dev/null 2>&1; then
+      warn "af_is_double symbols visible in ArrayFire libraries:"
+      nm -D "${af_libdir}"/libaf*.so* 2>/dev/null | grep 'af_is_double' || true
+    fi
+    warn "ldd on libafcuda.so:"
+    ldd "${af_libdir}/libafcuda.so" || true
+    die "Cannot link a test program against ArrayFire; refusing to build PLUMED without ArrayFire support."
+  fi
+  ok "PLUMED ArrayFire link probe passed with LIBS='${arrayfire_libs}'."
+
+  export LIBRARY_PATH="${af_libdir}:${FFTW_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LIBRARY_PATH:-}"
+  local plumed_configure_log="${plumed_src}/configure_plumed_arrayfire.log"
+
+  env LIBS="${arrayfire_libs}" ./configure \
     --prefix="${PLUMED_ROOT}" \
     CC="${MPI_ROOT}/bin/mpicc" \
     CXX="${MPI_ROOT}/bin/mpicxx" \
@@ -1392,12 +1679,28 @@ stage_plumed() {
     --enable-af_cuda \
     "${plumed_python_config[@]}" \
     --verbose \
-    CPPFLAGS="-I${AF_ROOT}/include -I${FFTW_ROOT}/include -I${CUDA_HOME}/include -I${CUDA_HOME}/targets/x86_64-linux/include" \
-    LDFLAGS="-L${AF_ROOT}/lib -Wl,-rpath,${AF_ROOT}/lib -L${FFTW_ROOT}/lib -Wl,-rpath,${FFTW_ROOT}/lib -L${FMT_ROOT}/lib -Wl,-rpath,${FMT_ROOT}/lib -L${FMT_ROOT}/lib64 -Wl,-rpath,${FMT_ROOT}/lib64 -L${MPI_ROOT}/lib -Wl,-rpath,${MPI_ROOT}/lib -L${CUDA_HOME}/lib64 -Wl,-rpath,${CUDA_HOME}/lib64 -L${CUDA_HOME}/targets/x86_64-linux/lib -Wl,-rpath,${CUDA_HOME}/targets/x86_64-linux/lib"
+    CPPFLAGS="${plumed_cppflags}" \
+    LDFLAGS="${plumed_ldflags}" \
+    2>&1 | tee "${plumed_configure_log}"
 
   info "Requested PLUMED features after configure:"
-  grep -E "has arrayfire|has arrayfire_cuda|has fftw|has mpi|module isdb" \
-    src/config/config.txt || true
+  grep -E "has arrayfire|has arrayfire_cuda|has fftw|has mpi|module isdb|__PLUMED_HAS_ARRAYFIRE" \
+    src/config/config.txt src/config/config.h "${plumed_configure_log}" 2>/dev/null || true
+
+  if grep -Eq "cannot enable __PLUMED_HAS_ARRAYFIRE(_CUDA)?" "${plumed_configure_log}" config.log 2>/dev/null; then
+    die "PLUMED configure could not enable ArrayFire/ArrayFire-CUDA; refusing to continue because SAXS requires it. See ${plumed_configure_log}"
+  fi
+
+  local plumed_af_ok=0 plumed_af_cuda_ok=0
+  if grep -R -Eq '(^|[[:space:]])#define[[:space:]]+__PLUMED_HAS_ARRAYFIRE[[:space:]]+1|(^|[[:space:]])__PLUMED_HAS_ARRAYFIRE([[:space:]=]|$)|has arrayfire([^_[:alnum:]]|[[:space:]]).*yes' src/config "${plumed_configure_log}" config.log 2>/dev/null; then
+    plumed_af_ok=1
+  fi
+  if grep -R -Eq '(^|[[:space:]])#define[[:space:]]+__PLUMED_HAS_ARRAYFIRE_CUDA[[:space:]]+1|(^|[[:space:]])__PLUMED_HAS_ARRAYFIRE_CUDA([[:space:]=]|$)|has arrayfire_cuda([^[:alnum:]]|[[:space:]]).*yes' src/config "${plumed_configure_log}" config.log 2>/dev/null; then
+    plumed_af_cuda_ok=1
+  fi
+  [[ "${plumed_af_ok}" -eq 1 ]] || die "PLUMED configured without __PLUMED_HAS_ARRAYFIRE; stopping instead of installing a useless SAXS build."
+  [[ "${plumed_af_cuda_ok}" -eq 1 ]] || die "PLUMED configured without __PLUMED_HAS_ARRAYFIRE_CUDA; stopping instead of installing a useless SAXS build."
+  ok "PLUMED configure enabled ArrayFire and ArrayFire-CUDA."
   # Do not let PLUMED runtime environment variables leak into the build-tree
   # executable used for generated files such as json/syntax.json.
   env -u PLUMED_ROOT -u PLUMED_INSTALL_PREFIX -u PLUMED_KERNEL -u PLUMED_PREFIX make -j"${NPROC}"
@@ -1521,7 +1824,7 @@ stage_gromacs() {
     || die "PLUMED kernel not found at ${plumed_kernel}. Build/fix the plumed stage first."
 
   export PATH="${plumed_prefix}/bin:${MPI_ROOT}/bin:${CUDA_HOME}/bin:${PATH}"
-  export LD_LIBRARY_PATH="${plumed_prefix}/lib:${AF_ROOT}/lib:${FFTW_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+  export LD_LIBRARY_PATH="${plumed_prefix}/lib:${AF_ROOT}/lib:${AF_ROOT}/lib64:${FFTW_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
   export PKG_CONFIG_PATH="${plumed_prefix}/lib/pkgconfig:${FFTW_ROOT}/lib/pkgconfig:${FMT_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
   export CMAKE_PREFIX_PATH="${plumed_prefix}:${FFTW_ROOT}:${MPI_ROOT}:${CUDA_HOME}:${CMAKE_PREFIX_PATH:-}"
 
@@ -1555,12 +1858,21 @@ stage_gromacs() {
     nvml_args+=("-DNVML_LIBRARY=${CUDA_HOME}/targets/x86_64-linux/lib/stubs/libnvidia-ml.so")
   fi
 
+  local cuda_cccl_args=()
+  if [[ -d "${CUDA_HOME}/include/cccl" ]]; then
+    info "CUDA CCCL headers detected; adding ${CUDA_HOME}/include/cccl to GROMACS CUDA include paths."
+    cuda_cccl_args+=("-DCMAKE_CUDA_FLAGS=-I${CUDA_HOME}/include/cccl ${CMAKE_CUDA_FLAGS:-}")
+  fi
+
   mapfile -t cmake_iso < <(cmake_common_isolation_args)
   cmake .. \
     -DCMAKE_INSTALL_PREFIX="${GMX_ROOT}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_STANDARD=17 \
+    -DCMAKE_CUDA_STANDARD_REQUIRED=ON \
     -DCMAKE_C_COMPILER="${MPI_ROOT}/bin/mpicc" \
     -DCMAKE_CXX_COMPILER="${MPI_ROOT}/bin/mpicxx" \
+    -DCMAKE_CUDA_COMPILER="${CUDACXX:-${CUDA_HOME}/bin/nvcc}" \
     -DGMX_MPI=ON \
     -DGMX_THREAD_MPI=OFF \
     -DGMX_GPU=CUDA \
@@ -1581,6 +1893,7 @@ stage_gromacs() {
     -DCMAKE_INSTALL_RPATH="${plumed_prefix}/lib;${FFTW_ROOT}/lib;${MPI_ROOT}/lib;${CUDA_HOME}/lib64;${CUDA_HOME}/targets/x86_64-linux/lib" \
     -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
     "${nvml_args[@]}" \
+    "${cuda_cccl_args[@]}" \
     "${cmake_iso[@]}"
 
   info "GROMACS PLUMED/CUDA/MPI cache entries:"
@@ -1668,7 +1981,21 @@ postflight_stack_checks() {
 
   if stage_done openmpi || [[ -x "${MPI_ROOT}/bin/mpicc" ]]; then _pf_ok_exe "${MPI_ROOT}/bin/mpicc" "OpenMPI mpicc"; fi
   if stage_done fftw || [[ -e "${FFTW_ROOT}/lib/libfftw3f.so" ]]; then _pf_ok_file "${FFTW_ROOT}/lib/libfftw3f.so" "FFTW single-precision library"; fi
-  if stage_done arrayfire || [[ -e "${AF_ROOT}/lib/libafcuda.so" ]]; then _pf_ok_file "${AF_ROOT}/lib/libafcuda.so" "ArrayFire CUDA library"; fi
+  local af_pf_lib=""
+  if [[ -e "${AF_ROOT}/lib/libafcuda.so" ]]; then
+    af_pf_lib="${AF_ROOT}/lib/libafcuda.so"
+  elif [[ -e "${AF_ROOT}/lib64/libafcuda.so" ]]; then
+    af_pf_lib="${AF_ROOT}/lib64/libafcuda.so"
+  else
+    af_pf_lib="$(find "${AF_ROOT}" -maxdepth 3 -name 'libafcuda.so*' -print 2>/dev/null | sort | head -n1 || true)"
+  fi
+  if stage_done arrayfire || [[ -n "${af_pf_lib}" ]]; then
+    if [[ -n "${af_pf_lib}" ]]; then
+      _pf_ok_file "${af_pf_lib}" "ArrayFire CUDA library"
+    else
+      warn "ArrayFire CUDA library missing under ${AF_ROOT}/lib or ${AF_ROOT}/lib64"; failures=$((failures + 1))
+    fi
+  fi
   if stage_done plumed || [[ -x "${PLUMED_ROOT}/bin/plumed" ]]; then
     _pf_ok_exe "${PLUMED_ROOT}/bin/plumed" "PLUMED executable"
     _pf_ok_file "${PLUMED_ROOT}/lib/libplumedKernel.so" "PLUMED kernel"
@@ -1706,6 +2033,7 @@ generate_activate_script() {
 
 export CUDA_HOME="${CUDA_HOME}"
 export CUDA_ROOT="\${CUDA_HOME}"
+export CUDACXX="\${CUDA_HOME}/bin/nvcc"
 export MPI_ROOT="${MPI_ROOT}"
 export FFTW_ROOT="${FFTW_ROOT}"
 export BOOST_ROOT="${BOOST_ROOT}"
@@ -1734,7 +2062,7 @@ export GMXMAN="\${GMX_ROOT}/share/man"
 export GMXDATA="\${GMX_ROOT}/share/gromacs"
 
 export PATH="\${GMX_ROOT}/bin:\${PLUMED_PREFIX}/bin:\${MPI_ROOT}/bin:\${CUDA_HOME}/bin:\${PATH}"
-export LD_LIBRARY_PATH="\${GMX_ROOT}/lib:\${GMX_ROOT}/lib64:\${PLUMED_PREFIX}/lib:\${AF_ROOT}/lib:\${FFTW_ROOT}/lib:\${BOOST_ROOT}/lib:\${FMT_ROOT}/lib:\${FMT_ROOT}/lib64:\${SPDLOG_ROOT}/lib:\${SPDLOG_ROOT}/lib64:\${MPI_ROOT}/lib:\${CUDA_HOME}/lib64:\${CUDA_HOME}/targets/x86_64-linux/lib:\${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="\${GMX_ROOT}/lib:\${GMX_ROOT}/lib64:\${PLUMED_PREFIX}/lib:\${AF_ROOT}/lib:\${AF_ROOT}/lib64:\${FFTW_ROOT}/lib:\${BOOST_ROOT}/lib:\${FMT_ROOT}/lib:\${FMT_ROOT}/lib64:\${SPDLOG_ROOT}/lib:\${SPDLOG_ROOT}/lib64:\${MPI_ROOT}/lib:\${CUDA_HOME}/lib64:\${CUDA_HOME}/targets/x86_64-linux/lib:\${LD_LIBRARY_PATH:-}"
 export PKG_CONFIG_PATH="\${GMX_ROOT}/lib/pkgconfig:\${GMX_ROOT}/lib64/pkgconfig:\${PLUMED_PREFIX}/lib/pkgconfig:\${FFTW_ROOT}/lib/pkgconfig:\${FMT_ROOT}/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
 export CMAKE_PREFIX_PATH="\${GMX_ROOT}:\${PLUMED_PREFIX}:\${AF_ROOT}:\${FFTW_ROOT}:\${BOOST_ROOT}:\${FMT_ROOT}:\${SPDLOG_ROOT}:\${MPI_ROOT}:\${CUDA_HOME}:\${CMAKE_PREFIX_PATH:-}"
 
@@ -1785,6 +2113,7 @@ print_config() {
   printf '  %-22s : %s\n' "Script version" "${SCRIPT_VERSION}"
   printf '  %-22s : %s\n' "Script dir"     "${SCRIPT_DIR}"
   printf '  %-22s : %s\n' "CUDA toolkit"   "${CUDA_HOME} (v${CUDA_VERSION})"
+  printf '  %-22s : %s\n' "CUDA compiler"  "${CUDACXX:-${CUDA_HOME}/bin/nvcc}"
   printf '  %-22s : %s\n' "Parent dir"     "${DIR}"
   printf '  %-22s : %s\n' "Env name"       "${NAME}"
   printf '  %-22s : %s\n' "Install root"   "${INSTALL_ROOT}"
