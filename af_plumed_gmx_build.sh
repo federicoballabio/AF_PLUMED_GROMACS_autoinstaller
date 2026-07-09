@@ -34,7 +34,7 @@ umask 022
 
 SCRIPT_NAME="$(basename "${0}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-SCRIPT_VERSION="4.8-gmx-auto-v25-arrayfire-libdir-postflight"
+SCRIPT_VERSION="4.9-gmx-auto-v26-nvrtc-isnan"
 
 ###############################################################################
 # Component versions (override from the environment if needed, e.g.
@@ -1099,16 +1099,56 @@ stage_arrayfire() {
   cd "arrayfire-${ARRAYFIRE_VERSION}"
   git submodule update --init --recursive
 
-  # Compatibility patch for ArrayFire 3.9.0 with newer GCC/libstdc++
-  # versions (e.g. GCC 13 on Ubuntu 24.04): std::isnan is available but
-  # ::isnan may not be declared when compiling C++17 code.  This patch is
-  # intentionally narrow and only touches the CUDA backend math helper that
-  # fails during afcuda compilation.
+  # Compatibility patch for ArrayFire 3.9.0 math.hpp across both normal
+  # host compilation and NVRTC runtime JIT compilation.  Some newer host
+  # compiler/libstdc++ combinations need std::isnan, while NVRTC does not
+  # provide std::isnan in the runtime-compiled CUDA header path.  Use a tiny
+  # wrapper macro: std::isnan for normal C++ compilation, global isnan for
+  # NVRTC (__CUDACC_RTC__).  This avoids the runtime PLUMED/SAXS failure:
+  #   NVRTC_ERROR_COMPILATION: namespace "std" has no member "isnan".
   local af_cuda_math="src/backend/cuda/math.hpp"
   if [[ -f "${af_cuda_math}" ]]; then
-    if grep -q '::isnan' "${af_cuda_math}"; then
-      info "Patching ArrayFire CUDA math.hpp for GCC/libstdc++ isnan compatibility."
-      sed -i 's/::isnan/std::isnan/g' "${af_cuda_math}"
+    if grep -Eq '(^|[^A-Za-z0-9_])(::|std::)?isnan[[:space:]]*\(' "${af_cuda_math}"; then
+      info "Patching ArrayFire CUDA math.hpp for host+NVRTC isnan compatibility."
+      python3 - "${af_cuda_math}" <<'PYEOF'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+
+macro = """#ifndef AF_CUDA_MATH_ISNAN
+#  if defined(__CUDACC_RTC__)
+#    define AF_CUDA_MATH_ISNAN(x) isnan(x)
+#  else
+#    define AF_CUDA_MATH_ISNAN(x) std::isnan(x)
+#  endif
+#endif
+"""
+
+if 'AF_CUDA_MATH_ISNAN' not in text:
+    # Put the macro after the last leading #include block.  This keeps it near
+    # the math declarations while avoiding assumptions about exact line numbers.
+    lines = text.splitlines(True)
+    insert_at = 0
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith('#include'):
+            insert_at = i + 1
+    lines.insert(insert_at, '\n' + macro + '\n')
+    text = ''.join(lines)
+
+# Replace only namespace-qualified/global isnan calls, not the helper/macro name.
+# The original ArrayFire source uses ::isnan; earlier installer versions changed
+# that to std::isnan.  Both variants are normalized here.
+text = re.sub(r'(?<![A-Za-z0-9_])(?:std::|::)?isnan\s*\(', 'AF_CUDA_MATH_ISNAN(', text)
+
+# The replacement above must not rewrite the macro body itself.
+text = text.replace('#    define AF_CUDA_MATH_ISNAN(x) AF_CUDA_MATH_ISNAN(x)', '#    define AF_CUDA_MATH_ISNAN(x) isnan(x)')
+text = text.replace('#    define AF_CUDA_MATH_ISNAN(x) std::AF_CUDA_MATH_ISNAN(x)', '#    define AF_CUDA_MATH_ISNAN(x) std::isnan(x)')
+
+path.write_text(text)
+PYEOF
     fi
   fi
 
