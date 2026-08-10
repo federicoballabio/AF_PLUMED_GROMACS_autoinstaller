@@ -12,6 +12,8 @@
 #
 # Key features vs. the original recipe:
 #   * CUDA toolkit is auto-detected, or given explicitly with --cuda <path>.
+#   * v32 can optionally bootstrap a private CUDA Toolkit (never the driver)
+#     and/or a private CMake into a user-controlled path for rootless HPC use.
 #   * Install location is composed from --dir <parent> and --name <env-name>;
 #     everything lands under <dir>/<name>.
 #   * A checkpoint system lets the build resume from the last completed stage
@@ -49,7 +51,7 @@ umask 022
 
 SCRIPT_NAME="$(basename "${0}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-SCRIPT_VERSION="6.0-gmx-auto-v31-transactional-saxs"
+SCRIPT_VERSION="6.1-gmx-auto-v32.1-toolchain-bootstrap-transactional-saxs"
 
 ###############################################################################
 # Component versions (override from the environment if needed, e.g.
@@ -80,6 +82,26 @@ PLUMED_SAXS_CPP="${PLUMED_SAXS_CPP:-}"
 # contains symlinks inside the install root; no system files are modified.
 AUTO_REPAIR="${AUTO_REPAIR:-1}"
 CUDA_SHIM_DIR="${CUDA_SHIM_DIR:-auto}"
+
+# Optional rootless toolchain bootstrap (v32). Disabled by default, preserving
+# all existing behavior. These paths may point anywhere writable by the user.
+INSTALL_CUDA=0
+INSTALL_CMAKE=0
+TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-}"
+CUDA_BOOTSTRAP_VERSION="${CUDA_BOOTSTRAP_VERSION:-auto}"
+CUDA_INSTALL_DIR="${CUDA_INSTALL_DIR:-}"
+CUDA_RUNFILE_URL="${CUDA_RUNFILE_URL:-}"
+CUDA_RUNFILE="${CUDA_RUNFILE:-}"
+CUDA_DRIVER_VERSION="${CUDA_DRIVER_VERSION:-auto}"
+CMAKE_BOOTSTRAP_VERSION="${CMAKE_BOOTSTRAP_VERSION:-3.31.12}"
+CMAKE_INSTALL_DIR="${CMAKE_INSTALL_DIR:-}"
+CMAKE_DOWNLOAD_URL="${CMAKE_DOWNLOAD_URL:-}"
+CMAKE_ARCHIVE="${CMAKE_ARCHIVE:-}"
+CMAKE_ROOT="${CMAKE_ROOT:-}"
+TOOLCHAIN_DOWNLOAD_DIR=""
+RESOLVED_CUDA_BOOTSTRAP_VERSION=""
+RESOLVED_NVIDIA_DRIVER_VERSION=""
+
 # Optional extra search locations for unusual CUDA packages.  Separate entries
 # with ':' like PATH, e.g. CUDA_EXTRA_INCLUDE_DIRS=/opt/cuda/include:/foo/include.
 CUDA_EXTRA_INCLUDE_DIRS="${CUDA_EXTRA_INCLUDE_DIRS:-}"
@@ -265,6 +287,33 @@ Common options:
                         (gromacs-2025.0 for 2025.x, gromacs-2024.3 for 2024.x).
   --gmx-simd <simd>    GROMACS SIMD target. Default: AVX2_256.
 
+Private toolchain bootstrap (opt-in; default behavior is unchanged):
+  --install-cuda       Install a private NVIDIA CUDA Toolkit before the build.
+                       The NVIDIA driver is NEVER installed or modified.
+  --cuda-version <v>   Toolkit version. Default: auto (currently 12.6.3).
+                       12.6.3 has a curated built-in NVIDIA runfile URL; other
+                       versions require --cuda-runfile-url or --cuda-runfile.
+  --cuda-install-dir <path>
+                       Exact CUDA prefix. Default: <toolchain-dir>/cuda-<version>.
+  --cuda-runfile-url <url>
+                       Official NVIDIA .run installer URL for a custom version.
+  --cuda-runfile <file>
+                       Existing local NVIDIA .run installer (offline HPC use).
+  --cuda-driver-version <v|auto>
+                       Driver version used for compatibility checks. Default:
+                       auto (nvidia-smi, /proc, or modinfo). Supply it manually
+                       on login nodes where the target GPU/driver is not visible.
+  --install-cmake      Install a private prebuilt CMake before the build.
+  --cmake-version <v>  CMake version. Default: 3.31.12.
+  --cmake-install-dir <path>
+                       Exact CMake prefix. Default: <toolchain-dir>/cmake-<version>.
+  --cmake-url <url>    Override the official Kitware archive URL.
+  --cmake-archive <file>
+                       Existing local CMake .tar.gz archive (offline HPC use).
+  --toolchain-dir <path>
+                       Parent for private tools/downloads. Default: <dir>/toolchain.
+                       On HPC systems this should normally be inside $HOME.
+
 PLUMED/SAXS development:
   --update-saxs       Incrementally rebuild/install PLUMED after replacing only
                        src/isdb/SAXS.cpp in an existing full-stack installation.
@@ -348,6 +397,9 @@ Examples:
   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --update-saxs --dry-run
   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --update-saxs -j 4
   ./af_plumed_gmx_build.sh --dir $HOME/software --name gmx_gpu --gromacs-only --write-bashrc
+  ./af_plumed_gmx_build.sh --dir $HOME/builds --name gmx25 --gromacs-only \
+      --install-cuda --cuda-version 12.6.3 --install-cmake \
+      --toolchain-dir $HOME/software/toolchain --arch 70
   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --status
 EOF
 }
@@ -449,6 +501,24 @@ download() {
   fi
 }
 
+download_to() {
+  # download_to <url> <output-file>
+  local url="${1}" out="${2}"
+  mkdir -p "$(dirname "${out}")"
+  if [[ -s "${out}" ]]; then
+    info "Using cached download: ${out}"
+    return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -c -O "${out}" "${url}"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fL -C - -o "${out}" "${url}"
+  else
+    die "Neither wget nor curl is available to fetch ${url}"
+  fi
+  [[ -s "${out}" ]] || die "Download produced an empty file: ${out}"
+}
+
 download_first_available() {
   # download_first_available <output-filename> <url1> [url2 ...]
   local fname="${1}" url
@@ -504,6 +574,28 @@ parse_args() {
       --gromacs-patch=*) PLUMED_GROMACS_PATCH="${1#*=}"; shift ;;
       --gmx-simd)     GMX_SIMD="${2:?--gmx-simd requires a value}"; shift 2 ;;
       --gmx-simd=*)   GMX_SIMD="${1#*=}"; shift ;;
+      --install-cuda) INSTALL_CUDA=1; shift ;;
+      --cuda-version) CUDA_BOOTSTRAP_VERSION="${2:?--cuda-version requires a value}"; shift 2 ;;
+      --cuda-version=*) CUDA_BOOTSTRAP_VERSION="${1#*=}"; shift ;;
+      --cuda-install-dir) CUDA_INSTALL_DIR="${2:?--cuda-install-dir requires a path}"; shift 2 ;;
+      --cuda-install-dir=*) CUDA_INSTALL_DIR="${1#*=}"; shift ;;
+      --cuda-runfile-url) CUDA_RUNFILE_URL="${2:?--cuda-runfile-url requires a URL}"; shift 2 ;;
+      --cuda-runfile-url=*) CUDA_RUNFILE_URL="${1#*=}"; shift ;;
+      --cuda-runfile) CUDA_RUNFILE="${2:?--cuda-runfile requires a file}"; shift 2 ;;
+      --cuda-runfile=*) CUDA_RUNFILE="${1#*=}"; shift ;;
+      --cuda-driver-version) CUDA_DRIVER_VERSION="${2:?--cuda-driver-version requires a value}"; shift 2 ;;
+      --cuda-driver-version=*) CUDA_DRIVER_VERSION="${1#*=}"; shift ;;
+      --install-cmake) INSTALL_CMAKE=1; shift ;;
+      --cmake-version) CMAKE_BOOTSTRAP_VERSION="${2:?--cmake-version requires a value}"; shift 2 ;;
+      --cmake-version=*) CMAKE_BOOTSTRAP_VERSION="${1#*=}"; shift ;;
+      --cmake-install-dir) CMAKE_INSTALL_DIR="${2:?--cmake-install-dir requires a path}"; shift 2 ;;
+      --cmake-install-dir=*) CMAKE_INSTALL_DIR="${1#*=}"; shift ;;
+      --cmake-url) CMAKE_DOWNLOAD_URL="${2:?--cmake-url requires a URL}"; shift 2 ;;
+      --cmake-url=*) CMAKE_DOWNLOAD_URL="${1#*=}"; shift ;;
+      --cmake-archive) CMAKE_ARCHIVE="${2:?--cmake-archive requires a file}"; shift 2 ;;
+      --cmake-archive=*) CMAKE_ARCHIVE="${1#*=}"; shift ;;
+      --toolchain-dir) TOOLCHAIN_DIR="${2:?--toolchain-dir requires a path}"; shift 2 ;;
+      --toolchain-dir=*) TOOLCHAIN_DIR="${1#*=}"; shift ;;
       --plumed-patch-dir) PLUMED_PATCH_DIR="${2:?--plumed-patch-dir requires a path}"; shift 2 ;;
       --plumed-patch-dir=*) PLUMED_PATCH_DIR="${1#*=}"; shift ;;
       --saxs-cpp)     PLUMED_SAXS_CPP="${2:?--saxs-cpp requires a file}"; shift 2 ;;
@@ -537,6 +629,8 @@ validate_args() {
   [[ -n "${DIR}" ]] || { err "--dir is required."; usage; exit 2; }
 
   if [[ "${UPDATE_SAXS}" -eq 1 ]]; then
+    [[ "${INSTALL_CUDA}" -eq 0 && "${INSTALL_CMAKE}" -eq 0 ]] \
+      || die "--update-saxs reuses the existing installation toolchain; do not combine it with --install-cuda/--install-cmake."
     [[ -n "${NAME}" ]] \
       || die "--update-saxs requires --name so an existing installation is selected explicitly."
     is_full_stack \
@@ -563,6 +657,9 @@ validate_args() {
   if [[ -n "${FROM_STAGE}" && -n "${ONLY_STAGE}" ]]; then
     die "--from and --only are mutually exclusive."
   fi
+  if [[ "${DO_STATUS}" -eq 1 && ( "${INSTALL_CUDA}" -eq 1 || "${INSTALL_CMAKE}" -eq 1 ) ]]; then
+    die "--status is read-only and cannot be combined with --install-cuda/--install-cmake."
+  fi
   if [[ -n "${NAME}" && "${NAME}" == */* ]]; then
     die "--name must be a single folder component (no '/'). Use --dir for the parent path."
   fi
@@ -574,8 +671,391 @@ validate_args() {
     [[ "${PLUMED_PATCH_DIR}" != "auto" ]] && warn "--plumed-patch-dir is ignored in --gromacs-only mode."
   fi
 
+  if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
+    [[ "${CUDA_PATH}" == "auto" ]] \
+      || die "--install-cuda uses --cuda-install-dir for its destination; do not combine it with an explicit --cuda path."
+    [[ -z "${CUDA_RUNFILE_URL}" || -z "${CUDA_RUNFILE}" ]] \
+      || die "Use only one of --cuda-runfile-url or --cuda-runfile."
+  else
+    [[ "${CUDA_BOOTSTRAP_VERSION}" == "auto" ]] \
+      || warn "--cuda-version has no effect unless --install-cuda is used."
+    [[ -z "${CUDA_INSTALL_DIR}${CUDA_RUNFILE_URL}${CUDA_RUNFILE}" ]] \
+      || die "--cuda-install-dir/--cuda-runfile-url/--cuda-runfile require --install-cuda."
+  fi
+
+  if [[ "${INSTALL_CMAKE}" -eq 0 ]]; then
+    [[ "${CMAKE_BOOTSTRAP_VERSION}" == "3.31.12" ]] \
+      || warn "--cmake-version has no effect unless --install-cmake is used."
+    [[ -z "${CMAKE_INSTALL_DIR}${CMAKE_DOWNLOAD_URL}${CMAKE_ARCHIVE}" ]] \
+      || die "--cmake-install-dir/--cmake-url/--cmake-archive require --install-cmake."
+  fi
+  [[ -z "${CUDA_RUNFILE}" || -f "${CUDA_RUNFILE}" ]] \
+    || die "CUDA runfile not found: ${CUDA_RUNFILE}"
+  [[ -z "${CMAKE_ARCHIVE}" || -f "${CMAKE_ARCHIVE}" ]] \
+    || die "CMake archive not found: ${CMAKE_ARCHIVE}"
+
   return 0
 }
+
+###############################################################################
+# Optional private toolchain bootstrap (v32)
+###############################################################################
+cuda_bootstrap_catalog_runfile_url() {
+  # Deliberately curated. NVIDIA runfile filenames embed a driver build number,
+  # so unknown versions must be supplied explicitly instead of guessed.
+  case "${1}" in
+    12.6.3)
+      printf '%s\n' 'https://developer.download.nvidia.com/compute/cuda/12.6.3/local_installers/cuda_12.6.3_560.35.05_linux.run'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+cuda_bootstrap_default_version() {
+  # Conservative default with broad GPU support. CUDA 13 removes offline
+  # compilation/library support for pre-Turing GPUs such as Volta/V100.
+  printf '%s\n' '12.6.3'
+}
+
+detect_nvidia_driver_version() {
+  local v=""
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    v="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits 2>/dev/null \
+      | awk 'NF{print $1; exit}' || true)"
+  fi
+  if [[ -z "${v}" && -r /proc/driver/nvidia/version ]]; then
+    v="$(grep -oE 'Kernel Module[[:space:]]+[0-9]+([.][0-9]+)+' /proc/driver/nvidia/version 2>/dev/null \
+      | grep -oE '[0-9]+([.][0-9]+)+' | head -n1 || true)"
+  fi
+  if [[ -z "${v}" ]] && command -v modinfo >/dev/null 2>&1; then
+    v="$(modinfo -F version nvidia 2>/dev/null | head -n1 || true)"
+  fi
+  printf '%s\n' "${v}"
+}
+
+cuda_driver_minimum_for_toolkit() {
+  # NVIDIA Linux minor-version compatibility floors by toolkit major family.
+  case "${1%%.*}" in
+    11) printf '%s\n' '450.80.02' ;;
+    12) printf '%s\n' '525.60.13' ;;
+    13) printf '%s\n' '580.00' ;;
+    *) return 1 ;;
+  esac
+}
+
+visible_cuda_archs_for_bootstrap() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null \
+    | while IFS= read -r cap; do _normalize_cuda_arch_token "${cap}"; done \
+    | awk 'NF && !seen[$0]++' | sort -n | paste -sd';' -
+}
+
+validate_cuda_bootstrap_compatibility() {
+  local toolkit="${1}" driver="${2}" min_driver archs arch major
+  major="${toolkit%%.*}"
+  min_driver="$(cuda_driver_minimum_for_toolkit "${toolkit}" || true)"
+  [[ -n "${min_driver}" ]] \
+    || die "No built-in driver-compatibility rule for CUDA ${toolkit}. Supported toolkit major families are 11, 12 and 13."
+  version_ge "${driver}" "${min_driver}" \
+    || die "NVIDIA driver ${driver} is too old for CUDA ${toolkit}; need at least ${min_driver} for CUDA ${major}.x. Choose an older toolkit or ask the administrator to update the driver."
+
+  if (( major >= 13 )); then
+    archs=""
+    if [[ "${CUDA_ARCHS:-auto}" != "auto" ]]; then
+      archs="${CUDA_ARCHS//,/;}"
+      archs="${archs//[[:space:]]/}"
+    else
+      archs="$(visible_cuda_archs_for_bootstrap || true)"
+    fi
+    if [[ -n "${archs}" ]]; then
+      IFS=';' read -r -a _cuda_bootstrap_arch_items <<< "${archs}"
+      for arch in "${_cuda_bootstrap_arch_items[@]}"; do
+        arch="$(_normalize_cuda_arch_token "${arch}")"
+        [[ -n "${arch}" ]] || continue
+        if (( 10#${arch} < 75 )); then
+          die "CUDA ${toolkit} cannot target compute capability ${arch}; CUDA 13 removed offline compilation/library support for pre-Turing GPUs. Use CUDA 12.x."
+        fi
+      done
+    else
+      warn "CUDA ${toolkit} is 13.x but GPU architecture is not visible. On a GPU-less/login node pass --arch explicitly; CUDA 13 requires Turing (75) or newer."
+    fi
+  fi
+}
+
+cmake_platform_tag() {
+  local machine
+  [[ "$(uname -s)" == "Linux" ]] \
+    || die "Private prebuilt CMake bootstrap currently supports Linux only."
+  machine="$(uname -m)"
+  case "${machine}" in
+    x86_64|amd64) printf '%s\n' 'linux-x86_64' ;;
+    aarch64|arm64) printf '%s\n' 'linux-aarch64' ;;
+    *) die "No prebuilt CMake bootstrap mapping for architecture '${machine}'. Install CMake manually or put it on PATH." ;;
+  esac
+}
+
+resolve_toolchain_bootstrap() {
+  [[ "${INSTALL_CUDA}" -eq 1 || "${INSTALL_CMAKE}" -eq 1 ]] || return 0
+
+  DIR="$(abspath "${DIR}")"
+  if [[ -z "${TOOLCHAIN_DIR}" ]]; then
+    TOOLCHAIN_DIR="${DIR%/}/toolchain"
+  else
+    TOOLCHAIN_DIR="$(abspath "${TOOLCHAIN_DIR}")"
+  fi
+  TOOLCHAIN_DOWNLOAD_DIR="${TOOLCHAIN_DIR}/downloads"
+
+  if [[ "${INSTALL_CMAKE}" -eq 1 ]]; then
+    [[ "${CMAKE_BOOTSTRAP_VERSION}" =~ ^[0-9]+[.][0-9]+([.][0-9]+)?$ ]] \
+      || die "Invalid --cmake-version '${CMAKE_BOOTSTRAP_VERSION}'."
+    if [[ -z "${CMAKE_INSTALL_DIR}" ]]; then
+      CMAKE_INSTALL_DIR="${TOOLCHAIN_DIR}/cmake-${CMAKE_BOOTSTRAP_VERSION}"
+    else
+      CMAKE_INSTALL_DIR="$(abspath "${CMAKE_INSTALL_DIR}")"
+    fi
+    case "${GROMACS_VERSION}" in
+      2025*) version_ge "${CMAKE_BOOTSTRAP_VERSION}" "3.28" \
+               || die "Requested CMake ${CMAKE_BOOTSTRAP_VERSION} is too old for GROMACS ${GROMACS_VERSION}; use CMake 3.28+." ;;
+      2024*) version_ge "${CMAKE_BOOTSTRAP_VERSION}" "3.18.4" \
+               || die "Requested CMake ${CMAKE_BOOTSTRAP_VERSION} is too old for GROMACS ${GROMACS_VERSION}; use CMake 3.18.4+." ;;
+    esac
+    if [[ -z "${CMAKE_DOWNLOAD_URL}" && -z "${CMAKE_ARCHIVE}" ]]; then
+      local cmake_tag
+      cmake_tag="$(cmake_platform_tag)"
+      CMAKE_DOWNLOAD_URL="https://github.com/Kitware/CMake/releases/download/v${CMAKE_BOOTSTRAP_VERSION}/cmake-${CMAKE_BOOTSTRAP_VERSION}-${cmake_tag}.tar.gz"
+    fi
+  fi
+
+  if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
+    if [[ "${CUDA_BOOTSTRAP_VERSION}" == "auto" ]]; then
+      RESOLVED_CUDA_BOOTSTRAP_VERSION="$(cuda_bootstrap_default_version)"
+    else
+      RESOLVED_CUDA_BOOTSTRAP_VERSION="${CUDA_BOOTSTRAP_VERSION}"
+    fi
+    [[ "${RESOLVED_CUDA_BOOTSTRAP_VERSION}" =~ ^[0-9]+[.][0-9]+([.][0-9]+)?$ ]] \
+      || die "Invalid --cuda-version '${RESOLVED_CUDA_BOOTSTRAP_VERSION}'. Expected e.g. 12.6.3."
+    if [[ "${GROMACS_VERSION}" == 2025* ]]; then
+      version_ge "${RESOLVED_CUDA_BOOTSTRAP_VERSION}" "12.1" \
+        || die "Requested CUDA ${RESOLVED_CUDA_BOOTSTRAP_VERSION} is too old for GROMACS ${GROMACS_VERSION}; CUDA 12.1+ is required."
+    fi
+
+    if [[ -z "${CUDA_INSTALL_DIR}" ]]; then
+      CUDA_INSTALL_DIR="${TOOLCHAIN_DIR}/cuda-${RESOLVED_CUDA_BOOTSTRAP_VERSION}"
+    else
+      CUDA_INSTALL_DIR="$(abspath "${CUDA_INSTALL_DIR}")"
+    fi
+
+    if [[ -z "${CUDA_RUNFILE_URL}" && -z "${CUDA_RUNFILE}" ]]; then
+      CUDA_RUNFILE_URL="$(cuda_bootstrap_catalog_runfile_url "${RESOLVED_CUDA_BOOTSTRAP_VERSION}" || true)"
+      [[ -n "${CUDA_RUNFILE_URL}" ]] \
+        || die "CUDA ${RESOLVED_CUDA_BOOTSTRAP_VERSION} is not in the curated runfile catalog. Provide --cuda-runfile-url <official-NVIDIA-url> or --cuda-runfile <local-file>."
+    fi
+
+    if [[ "${CUDA_DRIVER_VERSION}" == "auto" ]]; then
+      RESOLVED_NVIDIA_DRIVER_VERSION="$(detect_nvidia_driver_version)"
+    else
+      RESOLVED_NVIDIA_DRIVER_VERSION="${CUDA_DRIVER_VERSION}"
+    fi
+    [[ "${RESOLVED_NVIDIA_DRIVER_VERSION}" =~ ^[0-9]+([.][0-9]+)+$ ]] \
+      || die "Could not determine an NVIDIA driver version. On a GPU-less/login node pass --cuda-driver-version <version> from the target machine."
+    validate_cuda_bootstrap_compatibility "${RESOLVED_CUDA_BOOTSTRAP_VERSION}" "${RESOLVED_NVIDIA_DRIVER_VERSION}"
+  fi
+}
+
+toolchain_bootstrap_preflight() {
+  [[ "${INSTALL_CUDA}" -eq 1 || "${INSTALL_CMAKE}" -eq 1 ]] || return 0
+  section "Private toolchain bootstrap preflight"
+
+  local missing=() c
+  for c in bash awk grep find; do
+    command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+  done
+  if [[ "${INSTALL_CMAKE}" -eq 1 ]]; then
+    for c in tar; do command -v "${c}" >/dev/null 2>&1 || missing+=("${c}"); done
+    if [[ -z "${CMAKE_ARCHIVE}" && "${CMAKE_DOWNLOAD_URL}" == https://github.com/Kitware/CMake/releases/download/* ]]; then
+      command -v sha256sum >/dev/null 2>&1 || missing+=("sha256sum")
+    fi
+  fi
+  if [[ -z "${CUDA_RUNFILE:-}" && -z "${CMAKE_ARCHIVE:-}" ]]; then
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+      missing+=("wget-or-curl")
+    fi
+  elif [[ -z "${CUDA_RUNFILE:-}" && "${INSTALL_CUDA}" -eq 1 ]]; then
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+      missing+=("wget-or-curl")
+    fi
+  elif [[ -z "${CMAKE_ARCHIVE:-}" && "${INSTALL_CMAKE}" -eq 1 ]]; then
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+      missing+=("wget-or-curl")
+    fi
+  fi
+  [[ ${#missing[@]} -eq 0 ]] \
+    || die "Missing tools required for private toolchain bootstrap: ${missing[*]}"
+  ok "Bootstrap helper tools present."
+
+  local probe="${TOOLCHAIN_DIR}"
+  while [[ ! -e "${probe}" && "${probe}" != "/" ]]; do probe="$(dirname "${probe}")"; done
+  [[ -w "${probe}" ]] \
+    || die "No write permission for ${probe}; cannot create private toolchain under ${TOOLCHAIN_DIR}."
+  ok "Private toolchain parent is writable via ${probe}."
+
+  local avail_kb avail_gb need_gb=2
+  [[ "${INSTALL_CUDA}" -eq 0 ]] || need_gb=12
+  avail_kb="$(df -Pk "${probe}" 2>/dev/null | awk 'NR==2{print $4}')"
+  if [[ -n "${avail_kb}" ]]; then
+    avail_gb=$(( avail_kb / 1024 / 1024 ))
+    if (( avail_gb < need_gb )); then
+      die "Only ~${avail_gb} GB free at ${probe}; private toolchain bootstrap needs at least ~${need_gb} GB headroom."
+    fi
+    ok "~${avail_gb} GB free at ${probe}."
+  fi
+
+  if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
+    ok "CUDA driver compatibility check passed: driver ${RESOLVED_NVIDIA_DRIVER_VERSION}, toolkit ${RESOLVED_CUDA_BOOTSTRAP_VERSION}."
+    info "CUDA bootstrap is toolkit-only; the NVIDIA driver is not an install target."
+  fi
+}
+
+print_toolchain_bootstrap_plan() {
+  [[ "${INSTALL_CUDA}" -eq 1 || "${INSTALL_CMAKE}" -eq 1 ]] || return 0
+  section "Private toolchain bootstrap plan"
+  printf '  %-24s : %s\n' "Toolchain parent" "${TOOLCHAIN_DIR}"
+  printf '  %-24s : %s\n' "Download cache" "${TOOLCHAIN_DOWNLOAD_DIR}"
+  if [[ "${INSTALL_CMAKE}" -eq 1 ]]; then
+    printf '  %-24s : %s\n' "CMake" "${CMAKE_BOOTSTRAP_VERSION} -> ${CMAKE_INSTALL_DIR}"
+    printf '  %-24s : %s\n' "CMake source" "${CMAKE_ARCHIVE:-${CMAKE_DOWNLOAD_URL}}"
+  else
+    printf '  %-24s : %s\n' "CMake bootstrap" "disabled"
+  fi
+  if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
+    printf '  %-24s : %s\n' "CUDA Toolkit" "${RESOLVED_CUDA_BOOTSTRAP_VERSION} -> ${CUDA_INSTALL_DIR}"
+    printf '  %-24s : %s\n' "CUDA source" "${CUDA_RUNFILE:-${CUDA_RUNFILE_URL}}"
+    printf '  %-24s : %s\n' "NVIDIA driver" "${RESOLVED_NVIDIA_DRIVER_VERSION} (existing; never modified)"
+    printf '  %-24s : %s\n' "Driver installation" "DISABLED (--toolkit only)"
+  else
+    printf '  %-24s : %s\n' "CUDA bootstrap" "disabled"
+  fi
+}
+
+install_private_cmake() {
+  [[ "${INSTALL_CMAKE}" -eq 1 ]] || return 0
+  section "Private CMake ${CMAKE_BOOTSTRAP_VERSION} bootstrap"
+
+  if [[ -x "${CMAKE_INSTALL_DIR}/bin/cmake" ]]; then
+    local existing
+    existing="$(${CMAKE_INSTALL_DIR}/bin/cmake --version 2>/dev/null | head -n1 | awk '{print $3}' || true)"
+    if [[ "${existing}" == "${CMAKE_BOOTSTRAP_VERSION}" ]]; then
+      ok "Reusing private CMake ${existing} at ${CMAKE_INSTALL_DIR}."
+      CMAKE_ROOT="${CMAKE_INSTALL_DIR}"
+      export CMAKE_ROOT
+      export PATH="${CMAKE_ROOT}/bin:${PATH}"
+      return 0
+    fi
+    die "CMake prefix ${CMAKE_INSTALL_DIR} contains version '${existing:-unknown}', not ${CMAKE_BOOTSTRAP_VERSION}. Choose a different --cmake-install-dir."
+  fi
+  if [[ -e "${CMAKE_INSTALL_DIR}" && -n "$(ls -A "${CMAKE_INSTALL_DIR}" 2>/dev/null)" ]]; then
+    die "CMake install directory is non-empty but has no matching cmake executable: ${CMAKE_INSTALL_DIR}"
+  fi
+
+  mkdir -p "${TOOLCHAIN_DOWNLOAD_DIR}" "$(dirname "${CMAKE_INSTALL_DIR}")"
+  local archive checksum_file archive_name tmp top installed
+  if [[ -n "${CMAKE_ARCHIVE}" ]]; then
+    archive="$(abspath "${CMAKE_ARCHIVE}")"
+    info "Using local CMake archive: ${archive}"
+  else
+    archive_name="$(basename "${CMAKE_DOWNLOAD_URL}")"
+    archive="${TOOLCHAIN_DOWNLOAD_DIR}/${archive_name}"
+    download_to "${CMAKE_DOWNLOAD_URL}" "${archive}"
+    if [[ "${CMAKE_DOWNLOAD_URL}" == https://github.com/Kitware/CMake/releases/download/v${CMAKE_BOOTSTRAP_VERSION}/* ]]; then
+      checksum_file="${TOOLCHAIN_DOWNLOAD_DIR}/cmake-${CMAKE_BOOTSTRAP_VERSION}-SHA-256.txt"
+      download_to "https://github.com/Kitware/CMake/releases/download/v${CMAKE_BOOTSTRAP_VERSION}/cmake-${CMAKE_BOOTSTRAP_VERSION}-SHA-256.txt" "${checksum_file}"
+      grep -F " ${archive_name}" "${checksum_file}" | (cd "${TOOLCHAIN_DOWNLOAD_DIR}" && sha256sum -c -) \
+        || die "CMake archive SHA-256 verification failed: ${archive}"
+      ok "CMake archive SHA-256 verified against Kitware release metadata."
+    else
+      warn "Custom CMake URL supplied; automatic Kitware SHA-256 manifest verification is skipped."
+    fi
+  fi
+
+  tmp="$(mktemp -d "${TOOLCHAIN_DIR}/.cmake-install.XXXXXX")"
+  tar -xzf "${archive}" -C "${tmp}"
+  top="$(find "${tmp}" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
+  [[ -n "${top}" && -x "${top}/bin/cmake" ]] \
+    || { rm -rf "${tmp}"; die "CMake archive did not contain the expected prebuilt install tree."; }
+  rm -rf "${CMAKE_INSTALL_DIR}"
+  mv "${top}" "${CMAKE_INSTALL_DIR}"
+  rm -rf "${tmp}"
+
+  installed="$(${CMAKE_INSTALL_DIR}/bin/cmake --version | head -n1 | awk '{print $3}')"
+  [[ "${installed}" == "${CMAKE_BOOTSTRAP_VERSION}" ]] \
+    || die "Private CMake version verification failed: requested ${CMAKE_BOOTSTRAP_VERSION}, got ${installed}."
+  CMAKE_ROOT="${CMAKE_INSTALL_DIR}"
+  export CMAKE_ROOT
+  export PATH="${CMAKE_ROOT}/bin:${PATH}"
+  ok "Private CMake ${installed} installed at ${CMAKE_ROOT}."
+}
+
+install_private_cuda() {
+  [[ "${INSTALL_CUDA}" -eq 1 ]] || return 0
+  section "Private CUDA Toolkit ${RESOLVED_CUDA_BOOTSTRAP_VERSION} bootstrap (NO DRIVER)"
+
+  if [[ -x "${CUDA_INSTALL_DIR}/bin/nvcc" ]]; then
+    local existing
+    existing="$(get_cuda_version "${CUDA_INSTALL_DIR}/bin/nvcc" || true)"
+    if [[ "${RESOLVED_CUDA_BOOTSTRAP_VERSION}" == "${existing}"* || "${existing}" == "${RESOLVED_CUDA_BOOTSTRAP_VERSION}" ]]; then
+      ok "Reusing private CUDA ${existing} at ${CUDA_INSTALL_DIR}."
+      CUDA_PATH="${CUDA_INSTALL_DIR}"
+      return 0
+    fi
+    die "CUDA prefix ${CUDA_INSTALL_DIR} contains toolkit '${existing:-unknown}', not ${RESOLVED_CUDA_BOOTSTRAP_VERSION}. Choose a different --cuda-install-dir."
+  fi
+  if [[ -e "${CUDA_INSTALL_DIR}" && -n "$(ls -A "${CUDA_INSTALL_DIR}" 2>/dev/null)" ]]; then
+    die "CUDA install directory is non-empty but has no matching nvcc: ${CUDA_INSTALL_DIR}"
+  fi
+
+  mkdir -p "${TOOLCHAIN_DOWNLOAD_DIR}" "$(dirname "${CUDA_INSTALL_DIR}")"
+  local runfile runfile_name tmp driver_before driver_after installed
+  if [[ -n "${CUDA_RUNFILE}" ]]; then
+    runfile="$(abspath "${CUDA_RUNFILE}")"
+    info "Using local NVIDIA CUDA runfile: ${runfile}"
+  else
+    runfile_name="$(basename "${CUDA_RUNFILE_URL}")"
+    runfile="${TOOLCHAIN_DOWNLOAD_DIR}/${runfile_name}"
+    download_to "${CUDA_RUNFILE_URL}" "${runfile}"
+  fi
+  chmod u+x "${runfile}" 2>/dev/null || true
+
+  driver_before="$(detect_nvidia_driver_version)"
+  [[ -n "${driver_before}" ]] || driver_before="${RESOLVED_NVIDIA_DRIVER_VERSION}"
+  tmp="$(mktemp -d "${TOOLCHAIN_DIR}/.cuda-install.XXXXXX")"
+  mkdir -p "${CUDA_INSTALL_DIR}"
+
+  # No --driver is ever passed. --defaultroot and --no-man-page prevent the
+  # toolkit installer from needing system prefixes outside the user path.
+  bash "${runfile}" \
+    --silent \
+    --toolkit \
+    --toolkitpath="${CUDA_INSTALL_DIR}" \
+    --defaultroot="${CUDA_INSTALL_DIR}" \
+    --no-man-page \
+    --tmpdir="${tmp}"
+  rm -rf "${tmp}"
+
+  [[ -x "${CUDA_INSTALL_DIR}/bin/nvcc" ]] \
+    || die "CUDA installer completed but nvcc is missing: ${CUDA_INSTALL_DIR}/bin/nvcc"
+  installed="$(get_cuda_version "${CUDA_INSTALL_DIR}/bin/nvcc")"
+  [[ "${RESOLVED_CUDA_BOOTSTRAP_VERSION}" == "${installed}"* || "${installed}" == "${RESOLVED_CUDA_BOOTSTRAP_VERSION}" ]] \
+    || die "CUDA toolkit version verification failed: requested ${RESOLVED_CUDA_BOOTSTRAP_VERSION}, got ${installed}."
+
+  driver_after="$(detect_nvidia_driver_version)"
+  if [[ -n "${driver_before}" && -n "${driver_after}" && "${driver_before}" != "${driver_after}" ]]; then
+    die "NVIDIA driver version changed unexpectedly during toolkit-only installation (${driver_before} -> ${driver_after})."
+  fi
+  ok "NVIDIA driver remained unchanged (${driver_after:-${driver_before}})."
+  ok "Private CUDA Toolkit ${installed} installed at ${CUDA_INSTALL_DIR}."
+  CUDA_PATH="${CUDA_INSTALL_DIR}"
+}
+
 
 ###############################################################################
 # CUDA detection
@@ -1125,7 +1605,8 @@ preflight() {
   }
 
   local missing=()
-  local c required_tools=(tar make cmake pkg-config gcc g++ awk sed grep find)
+  local c required_tools=(tar make pkg-config gcc g++ awk sed grep find)
+  if [[ "${INSTALL_CMAKE}" -eq 0 ]]; then required_tools+=(cmake); fi
   if is_full_stack; then required_tools+=(git); fi
   for c in "${required_tools[@]}"; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
@@ -1138,6 +1619,10 @@ preflight() {
 On HPC, try 'module load' for the relevant compilers/cmake/git, or ask your admin."
   else
     ok "Required tools present."
+  fi
+
+  if [[ "${INSTALL_CMAKE}" -eq 1 && "${DRY_RUN}" -eq 1 && ! -x "${CMAKE_INSTALL_DIR}/bin/cmake" ]]; then
+    info "Private CMake ${CMAKE_BOOTSTRAP_VERSION} is scheduled at ${CMAKE_INSTALL_DIR}; system CMake is not required for this run."
   fi
 
   # CMake version. ArrayFire can work with older CMake releases. GROMACS
@@ -1172,8 +1657,10 @@ On HPC, try 'module load' for the relevant compilers/cmake/git, or ask your admi
     fi
   fi
 
-  # CUDA sanity.
-  if "${CUDA_HOME}/bin/nvcc" --version >/dev/null 2>&1; then
+  # CUDA sanity. A bootstrap dry-run intentionally has no nvcc yet.
+  if [[ "${INSTALL_CUDA}" -eq 1 && "${DRY_RUN}" -eq 1 && ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+    info "Private CUDA ${CUDA_VERSION} is scheduled at ${CUDA_HOME}; nvcc is not expected during --dry-run."
+  elif "${CUDA_HOME}/bin/nvcc" --version >/dev/null 2>&1; then
     ok "CUDA ${CUDA_VERSION} at ${CUDA_HOME}."
     export CUDACXX="${CUDA_HOME}/bin/nvcc"
   else
@@ -1184,20 +1671,24 @@ On HPC, try 'module load' for the relevant compilers/cmake/git, or ask your admi
   # packages. The auto-repair shim should have made these visible before we get
   # here.
   local hot_missing=() hf h l
-  while IFS= read -r h; do
-    if [[ ! -e "${CUDA_HOME}/include/${h}" && ! -e "${CUDA_HOME}/targets/x86_64-linux/include/${h}" ]]; then
-      hot_missing+=("${h}")
-    fi
-  done < <(cuda_required_headers)
-  while IFS= read -r l; do
-    if [[ ! -e "${CUDA_HOME}/lib64/${l}" && ! -e "${CUDA_HOME}/targets/x86_64-linux/lib/${l}" ]]; then
-      hot_missing+=("${l}")
-    fi
-  done < <(cuda_required_libraries)
-  if [[ ${#hot_missing[@]} -gt 0 ]]; then
-    _pf_fail "Missing hot CUDA headers/libraries: ${hot_missing[*]}"
+  if [[ "${INSTALL_CUDA}" -eq 1 && "${DRY_RUN}" -eq 1 && ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+    info "CUDA headers/libraries will be validated after the requested toolkit bootstrap."
   else
-    ok "Hot CUDA headers/libraries present."
+    while IFS= read -r h; do
+      if [[ ! -e "${CUDA_HOME}/include/${h}" && ! -e "${CUDA_HOME}/targets/x86_64-linux/include/${h}" ]]; then
+        hot_missing+=("${h}")
+      fi
+    done < <(cuda_required_headers)
+    while IFS= read -r l; do
+      if [[ ! -e "${CUDA_HOME}/lib64/${l}" && ! -e "${CUDA_HOME}/targets/x86_64-linux/lib/${l}" ]]; then
+        hot_missing+=("${l}")
+      fi
+    done < <(cuda_required_libraries)
+    if [[ ${#hot_missing[@]} -gt 0 ]]; then
+      _pf_fail "Missing hot CUDA headers/libraries: ${hot_missing[*]}"
+    else
+      ok "Hot CUDA headers/libraries present."
+    fi
   fi
 
   if is_gromacs_only; then
@@ -3606,6 +4097,11 @@ postflight_stack_checks() {
 ###############################################################################
 generate_activate_script() {
   local out="${INSTALL_ROOT}/activate.sh"
+  local cmake_activation_block=""
+  if [[ -n "${CMAKE_ROOT:-}" && -x "${CMAKE_ROOT}/bin/cmake" ]]; then
+    cmake_activation_block="export CMAKE_ROOT=\"${CMAKE_ROOT}\"
+export PATH=\"\${CMAKE_ROOT}/bin:\${PATH}\""
+  fi
   if is_gromacs_only; then
     local direct_gpu_block
     case "${GROMACS_VERSION}" in
@@ -3625,6 +4121,7 @@ export GMX_ENABLE_DIRECT_GPU_COMM="${GMX_ENABLE_DIRECT_GPU_COMM:-1}"'
 export CUDA_HOME="${CUDA_HOME}"
 export CUDA_ROOT="\${CUDA_HOME}"
 export CUDACXX="\${CUDA_HOME}/bin/nvcc"
+${cmake_activation_block}
 export FFTW_ROOT="${FFTW_ROOT}"
 export GMX_ROOT="${GMX_ROOT}"
 
@@ -3660,6 +4157,7 @@ EOF
 export CUDA_HOME="${CUDA_HOME}"
 export CUDA_ROOT="\${CUDA_HOME}"
 export CUDACXX="\${CUDA_HOME}/bin/nvcc"
+${cmake_activation_block}
 export MPI_ROOT="${MPI_ROOT}"
 export FFTW_ROOT="${FFTW_ROOT}"
 export BOOST_ROOT="${BOOST_ROOT}"
@@ -3764,6 +4262,15 @@ print_config() {
   printf '  %-22s : %s\n' "Auto repair"    "${AUTO_REPAIR}"
   printf '  %-22s : %s\n' "CUDA shim dir"  "${CUDA_SHIM_DIR}"
   printf '  %-22s : %s\n' "FFTW -march"    "${MARCH}"
+  if [[ "${INSTALL_CUDA}" -eq 1 || "${INSTALL_CMAKE}" -eq 1 ]]; then
+    printf '  %-22s : %s\n' "Toolchain parent" "${TOOLCHAIN_DIR}"
+    if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
+      printf '  %-22s : %s\n' "Private CUDA" "${RESOLVED_CUDA_BOOTSTRAP_VERSION} at ${CUDA_INSTALL_DIR}"
+    fi
+    if [[ "${INSTALL_CMAKE}" -eq 1 ]]; then
+      printf '  %-22s : %s\n' "Private CMake" "${CMAKE_BOOTSTRAP_VERSION} at ${CMAKE_INSTALL_DIR}"
+    fi
+  fi
 }
 
 print_plan() {
@@ -3815,6 +4322,7 @@ print_done_banner() {
   echo "  GROMACS      : ${GMX_ROOT}"
   echo "  FFTW         : ${FFTW_ROOT}"
   echo "  CUDA         : ${CUDA_HOME}"
+  [[ -z "${CMAKE_ROOT:-}" ]] || echo "  CMake        : ${CMAKE_ROOT}"
   if is_full_stack; then
     echo "  PLUMED       : ${PLUMED_ROOT}"
     echo "  PLUMED kernel: ${PLUMED_KERNEL}"
@@ -3860,7 +4368,24 @@ main() {
     return 0
   fi
 
-  detect_cuda
+  if [[ "${INSTALL_CUDA}" -eq 1 || "${INSTALL_CMAKE}" -eq 1 ]]; then
+    resolve_toolchain_bootstrap
+    print_toolchain_bootstrap_plan
+    toolchain_bootstrap_preflight
+  fi
+
+  if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
+    # Resolve install/checkpoint paths before downloading the toolkit. The real
+    # CUDA installation happens only after the target install-root guard passes.
+    CUDA_HOME="${CUDA_INSTALL_DIR}"
+    CUDA_VERSION="${RESOLVED_CUDA_BOOTSTRAP_VERSION}"
+    CUDA_PATH="${CUDA_INSTALL_DIR}"
+    export CUDA_HOME
+    export CUDA_ROOT="${CUDA_HOME}"
+    export CUDACXX="${CUDA_HOME}/bin/nvcc"
+  else
+    detect_cuda
+  fi
   resolve_paths
 
   if [[ "${DO_STATUS}" -eq 1 ]]; then
@@ -3882,10 +4407,25 @@ main() {
     # Avoid Conda contaminating compiler/library discovery (no-op if absent).
     conda deactivate 2>/dev/null || true
 
+    # Bootstrap only after the install-root guard and after logging is active.
+    # This prevents multi-GB downloads when the selected environment name would
+    # be rejected, and records the bootstrap in the normal build log.
+    install_private_cmake
+    install_private_cuda
+    if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
+      detect_cuda
+    fi
+    if [[ -n "${CMAKE_ROOT:-}" && -x "${CMAKE_ROOT}/bin/cmake" ]]; then
+      export PATH="${CMAKE_ROOT}/bin:${PATH}"
+    fi
+
     ensure_cuda_development_layout
   else
-    # Dry-run should not write shims, but still report obvious layout risks.
-    if needs_cuda_shim; then
+    # Dry-run should not write shims or private toolchains.
+    if [[ "${INSTALL_CUDA}" -eq 1 || "${INSTALL_CMAKE}" -eq 1 ]]; then
+      info "Dry run: private toolchain directories/downloads will not be created."
+    fi
+    if [[ "${INSTALL_CUDA}" -eq 0 ]] && needs_cuda_shim; then
       warn "CUDA appears to use a split/non-standard layout. A real run will create a private CUDA shim under the install root."
     fi
   fi
