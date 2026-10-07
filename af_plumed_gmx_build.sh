@@ -6,14 +6,32 @@
 # ArrayFire CUDA backend, PLUMED (ISDB/SAXS + ArrayFire CUDA), and a
 # PLUMED-patched external-MPI GROMACS installation.
 #
-# Optional --gromacs-only route: builds only FFTW and standalone CUDA GROMACS,
-# with external MPI disabled and built-in thread-MPI enabled. This route is
-# intended for fast single-node workstation/HPC GPU installations.
+# Optional --gromacs-only route: builds only FFTW and standalone GROMACS,
+# with external MPI disabled and built-in thread-MPI enabled. CUDA remains the
+# default backend; combine with --cpu-only for a CUDA-free analysis build.
 #
 # Key features vs. the original recipe:
 #   * CUDA toolkit is auto-detected, or given explicitly with --cuda <path>.
 #   * v32 can optionally bootstrap a private CUDA Toolkit (never the driver)
 #     and/or a private CMake into a user-controlled path for rootless HPC use.
+#   * v33 adds an opt-in --cpu-only backend for lightweight login-node installs:
+#     GROMACS-only or PLUMED-patched GROMACS, both with thread-MPI and no CUDA.
+#     The established CUDA routes remain the default and are preserved.
+#   * v34 hardens compiler propagation and the CUDA + external-MPI route without
+#     changing established build modes/defaults. Explicit CC/CXX selections are
+#     preserved across conda deactivation, OpenMPI wrapper provenance is checked,
+#     MPI include paths are propagated to CUDA compilation, and PLUMED/SAXS
+#     provenance plus patch-reject handling are strengthened.
+#   * v34.1 adds an opt-in offline source-cache workflow for HPC systems whose
+#     compute nodes cannot access the Internet. --prefetch populates a shared
+#     cache on a networked node; --offline consumes only verified cached sources.
+#     Normal online build behavior is unchanged unless these options are used.
+#   * v34.2 adds an opt-in system/external-MPI provider, makes ArrayFire offline
+#     caches self-contained with the full dependency payload, adds resumable
+#     finalization, and makes final MPI checks launcher-aware and time-limited.
+#     Existing private-OpenMPI and online routes remain the defaults.
+#   * v34.2.1 makes source-only prefetch independent of GPU visibility and CUDA
+#     architecture resolution when the GROMACS version is explicitly selected.
 #   * Install location is composed from --dir <parent> and --name <env-name>;
 #     everything lands under <dir>/<name>.
 #   * A checkpoint system lets the build resume from the last completed stage
@@ -51,7 +69,7 @@ umask 022
 
 SCRIPT_NAME="$(basename "${0}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-SCRIPT_VERSION="6.1-gmx-auto-v32.1-toolchain-bootstrap-transactional-saxs"
+SCRIPT_VERSION="7.0-gmx-auto-v35-split-workspace-system-mpi-offline-finalize-transactional-saxs"
 
 ###############################################################################
 # Component versions (override from the environment if needed, e.g.
@@ -122,9 +140,12 @@ GMX_SIMD="${GMX_SIMD:-AVX2_256}"
 # baseline, e.g. MARCH=x86-64-v3 to stay portable.
 MARCH="${MARCH:-native}"
 
-# Ordered build-stage routes used by the checkpoint system. The full PLUMED
-# stack remains the default. --gromacs-only reduces the route to FFTW+GROMACS.
+# Ordered build-stage routes used by the checkpoint system. The established
+# CUDA full stack remains the default. CPU full mode deliberately omits
+# OpenMPI/Boost/fmt/spdlog/ArrayFire and builds FFTW + PLUMED + GROMACS.
 FULL_STAGES=(openmpi fftw boost fmt spdlog arrayfire plumed gromacs)
+SYSTEM_MPI_FULL_STAGES=(fftw boost fmt spdlog arrayfire plumed gromacs)
+CPU_FULL_STAGES=(fftw plumed gromacs)
 GROMACS_ONLY_STAGES=(fftw gromacs)
 STAGES=("${FULL_STAGES[@]}")
 
@@ -132,8 +153,12 @@ STAGES=("${FULL_STAGES[@]}")
 # Argument defaults
 ###############################################################################
 CUDA_PATH="auto"           # --cuda (auto or explicit toolkit root)
-DIR=""                     # --dir   (required)
+DIR=""                     # --dir   (required; install parent)
 NAME=""                    # --name  (default: build_<cudaver>)
+WORK_DIR="${WORK_DIR:-}"    # --work-dir (optional workspace parent; split layout)
+WORK_DIR_EXPLICIT=0
+WORK_ROOT=""
+SPLIT_LAYOUT=0
 NPROC="${NPROC:-}"         # -j/--jobs
 CUDA_ARCHS="${CUDA_ARCHS:-auto}"   # --arch  (auto, 80, or "70;80;90")
 PLUMED_REF="${PLUMED_REF:-master}"  # --plumed-ref
@@ -148,9 +173,45 @@ ASSUME_YES=0              # -y/--yes: assume "yes" (e.g. reuse a non-empty dir)
 NO_COLOR="${NO_COLOR:-0}"  # --no-color
 BUILD_MODE="${BUILD_MODE:-full}"  # full | gromacs-only
 BUILD_MODE_EXPLICIT=0
+ACCELERATOR="${ACCELERATOR:-cuda}"  # cuda | cpu; CUDA remains the default
 UPDATE_SAXS=0              # --update-saxs: incremental PLUMED/SAXS update
 ALLOW_DIRTY_PLUMED=0       # --allow-dirty-plumed: permit other tracked edits
 RUN_INSTALLCHECK=0         # --installcheck: run PLUMED's installed regtests
+FINALIZE_ONLY=0            # --finalize-only: rerun post-install validation/reporting only
+
+# External/system MPI is opt-in. The established default remains a private
+# OpenMPI build below <install-root>/openmpi. With --use-system-mpi the caller
+# supplies (or exposes on PATH) an existing OpenMPI-compatible installation.
+MPI_PROVIDER="${MPI_PROVIDER:-private}"   # private | system
+MPI_PREFIX="${MPI_PREFIX:-}"
+MPI_PROVIDER_EXPLICIT=0
+MPI_PREFIX_EXPLICIT=0
+MPI_RUNTIME_TIMEOUT="${MPI_RUNTIME_TIMEOUT:-30}"
+ARRAYFIRE_FULL_SOURCE_URL="${ARRAYFIRE_FULL_SOURCE_URL:-}"
+
+# v34 compiler intent capture. Some conda/module hooks alter CC/CXX during
+# deactivation. Preserve what the caller explicitly selected at script startup
+# and re-export the resolved executables before any build stage.
+REQUESTED_CC="${CC:-}"
+REQUESTED_CXX="${CXX:-}"
+REQUESTED_FC="${FC:-}"
+REQUESTED_CUDAHOSTCXX="${CUDAHOSTCXX:-}"
+BUILD_CC=""
+BUILD_CXX=""
+BUILD_FC=""
+BUILD_CUDAHOSTCXX=""
+PLUMED_PATCH_REJECT_STATUS="none"
+PLUMED_PATCH_REJECT_FILES=""
+
+# v34.1 opt-in source cache.  PREFETCH runs only source acquisition and exits;
+# OFFLINE forbids network source acquisition and copies/extracts only from the
+# verified cache.  SOURCE_CACHE defaults to <dir>/source_cache when either mode
+# is requested.
+PREFETCH=0
+OFFLINE=0
+SOURCE_CACHE="${SOURCE_CACHE:-}"
+SOURCE_CACHE_MANIFEST=""
+SOURCE_CACHE_SHA256=""
 
 # SAXS-update state used for automatic failure rollback.
 CURRENT_OPERATION="build"
@@ -184,6 +245,7 @@ SAXS_UPDATE_TRACKED_MISSING_LIST=""
 CUDA_HOME=""
 CUDA_VERSION=""
 INSTALL_ROOT=""
+WORK_ROOT=""
 SRC=""
 LOG_DIR=""
 LOG_FILE=""
@@ -237,24 +299,32 @@ Usage: af_plumed_gmx_build.sh --dir <parent-dir> [options]
 By default, builds OpenMPI, FFTW, Boost, fmt, spdlog, ArrayFire (CUDA),
 PLUMED and a PLUMED-patched external-MPI GROMACS installation into
 <parent-dir>/<name>. With --gromacs-only, builds only FFTW and standalone CUDA
-GROMACS with built-in thread-MPI. Both routes retain checkpoint/resume support.
+GROMACS with built-in thread-MPI. Add --cpu-only to either route for a CUDA-free
+login-node/analysis build. Existing CUDA behavior remains the default.
 
-With --update-saxs, reuses the existing configured PLUMED checkout under
-<parent-dir>/<name>/src/plumed2, replaces only src/isdb/SAXS.cpp, preserves the
-retained PLUMED Python-wrapper setting, performs an incremental PLUMED
-build/install, validates the installed kernel, and leaves GROMACS untouched.
-Before make install it snapshots the complete installed PLUMED prefix so a
-failed update can restore the pre-update installation. No source clone,
-checkout, configure, distclean, or GROMACS build is performed in this mode.
+With --update-saxs, reuses the existing configured PLUMED checkout in the
+recorded workspace, replaces only src/isdb/SAXS.cpp, preserves the retained
+PLUMED Python-wrapper setting, performs an incremental PLUMED build/install,
+validates the installed kernel, and leaves GROMACS untouched. If a v35 split
+workspace was removed but its durable source cache/provenance is still present,
+the PLUMED checkout is reconstructed and reconfigured before the transactional
+update. Before make install the complete installed PLUMED prefix is snapshotted
+so a failed update can restore the pre-update installation. GROMACS is never
+rebuilt by --update-saxs.
 
 Required:
   --dir <path>          Parent directory for the installation. The actual
                         install root is <dir>/<name>.
 
 Build route:
-  --gromacs-only       Build only FFTW + standalone CUDA GROMACS. Configures
+  --gromacs-only       Build only FFTW + standalone GROMACS. Configures
                        GMX_MPI=OFF and GMX_THREAD_MPI=ON, and does not apply a
-                       PLUMED patch. The executable is `gmx` (not `gmx_mpi`).
+                       PLUMED patch. CUDA is used by default; combine with
+                       --cpu-only for a CPU-only build. Executable: `gmx`.
+  --cpu-only           Disable the GPU/CUDA backend. With --gromacs-only this
+                       builds FFTW + CPU GROMACS/thread-MPI. With the full route
+                       it builds FFTW + CPU PLUMED + PLUMED-patched CPU GROMACS,
+                       also with thread-MPI and without OpenMPI/ArrayFire/CUDA.
   --mode <mode>        Explicit route: full or gromacs-only. Default: full.
   --full-stack         Explicitly select the original full PLUMED stack.
 
@@ -264,13 +334,23 @@ Common options:
                         If <dir>/<name> already exists and is non-empty (and is
                         not a previous run of this script), the build aborts and
                         asks for a different --name.
+  --work-dir <path>     Optional workspace parent. When set, sources, build
+                        trees, checkpoints, and build logs live under
+                        <work-dir>/<name>, while installed runtime files stay
+                        under <dir>/<name>. Without this option the historical
+                        layout is preserved exactly (<dir>/<name>/src, etc.).
+                        Intended for durable HOME workspaces with compact PUBLIC
+                        runtime installs; also useful with disposable SCRATCH
+                        validation workspaces.
   --cuda <path|auto>    CUDA toolkit root (must contain bin/nvcc), or auto.
+                       CUDA backend only; incompatible with --cpu-only.
                         Default: auto. Auto mode searches only fast/common places
                         (CUDA_HOME/CUDA_ROOT, PATH, --dir, script/current/home
                         software folders, /mnt/data/software, /usr/local, /opt,
                         /usr/lib) and selects the newest valid CUDA toolkit.
                         Manual --cuda /path still takes precedence.
   --arch <archs>        CUDA compute architecture(s), e.g. auto, 80, 86, 90, or 120.
+                       CUDA backend only; incompatible with --cpu-only.
                         Default: auto. In auto mode the script queries visible
                         NVIDIA GPU compute capabilities and converts them to
                         CMake CUDA architectures. For RTX 50-series / Blackwell,
@@ -279,13 +359,39 @@ Common options:
   -j, --jobs <n>        Parallel build jobs. Default: nproc.
   --plumed-ref <ref>    Git branch/tag/commit for PLUMED. Default: master.
   --gromacs-version <v> GROMACS version, or auto. Default: auto.
-                        auto selects 2025.4 only when GCC/G++ >=11 and CUDA >=12.1;
-                        otherwise it falls back to 2024.6.
+                        auto selects 2025.4 with GCC/G++ >=11; the CUDA backend
+                        additionally requires CUDA >=12.1. Otherwise 2024.6 is
+                        used as the compatibility fallback.
   --gromacs-url <url>   Primary GROMACS source tarball URL. Default: official HTTPS
                         for the selected version.
   --gromacs-patch <e>  PLUMED patch engine name, or auto. Default: auto
                         (gromacs-2025.0 for 2025.x, gromacs-2024.3 for 2024.x).
   --gmx-simd <simd>    GROMACS SIMD target. Default: AVX2_256.
+
+MPI provider for CUDA full-stack builds (opt-in; private OpenMPI stays default):
+  --use-system-mpi     Reuse an existing OpenMPI-compatible installation instead
+                       of building private OpenMPI. Valid only for the CUDA full
+                       stack; thread-MPI routes are unchanged.
+  --mpi-prefix <path>  Prefix containing bin/mpicc, bin/mpicxx and bin/mpirun.
+                       Implies --use-system-mpi. If omitted, the prefix is
+                       inferred from mpicc on PATH. Site modules may still need
+                       to be loaded before build/activation for transitive UCX,
+                       PMIx, UCC, or fabric libraries.
+
+Offline source cache (opt-in; normal online behavior is unchanged):
+  --prefetch           Populate the source cache for the selected build route
+                       and exit without compiling/installing anything. Run this
+                       on a networked login/service node.
+  --source-cache <dir> Shared cache directory. With --prefetch or --offline,
+                       default: <work-dir>/source_cache when --work-dir is used;
+                       otherwise <dir>/source_cache.
+  --offline            Disable network source acquisition. All required source
+                       archives/Git snapshots must already be present and pass
+                       SHA-256 verification in --source-cache. Intended for
+                       isolated compute nodes. ArrayFire cache snapshots include
+                       the full-source extern dependency payload.
+                       If --install-cmake is used, the selected prebuilt CMake
+                       archive is also prefetched/used from this cache.
 
 Private toolchain bootstrap (opt-in; default behavior is unchanged):
   --install-cuda       Install a private NVIDIA CUDA Toolkit before the build.
@@ -315,6 +421,10 @@ Private toolchain bootstrap (opt-in; default behavior is unchanged):
                        On HPC systems this should normally be inside $HOME.
 
 PLUMED/SAXS development:
+  NOTE / BOOKMARK: CPU support for the custom SAXS.cpp development/update
+  workflow is intentionally OUT OF SCOPE. --cpu-only --update-saxs and CPU
+  builds with explicit SAXS overrides are rejected. CPU PLUMED uses upstream
+  SAXS sources only; the validated CUDA/ArrayFire SAXS workflow is unchanged.
   --update-saxs       Incrementally rebuild/install PLUMED after replacing only
                        src/isdb/SAXS.cpp in an existing full-stack installation.
                        --name is required. The default candidate is the
@@ -363,7 +473,10 @@ Activation / environment export:
   --write-aliases       Append an activation alias to ~/.bash_aliases.
                         (An activate.sh is always written into the install root.)
 
-Checkpoint control:
+Checkpoint / finalization control:
+  --finalize-only       Do not compile. Re-run final PLUMED/GROMACS validation,
+                       post-flight checks, activate.sh generation and reports for
+                       an existing installation. --name is required.
   --from <stage>        Build from <stage> onward (earlier stages assumed done).
   --only <stage>        Build only <stage>.
   --force               Ignore checkpoints / rebuild everything; also permits
@@ -380,16 +493,21 @@ Other:
                         keeps existing checkpoints).
   -h, --help            Show this help.
 
-Full-stack stages: openmpi fftw boost fmt spdlog arrayfire plumed gromacs
-GROMACS-only stages: fftw gromacs
+CUDA full-stack stages (private MPI): openmpi fftw boost fmt spdlog arrayfire plumed gromacs
+CUDA full-stack stages (system MPI) : fftw boost fmt spdlog arrayfire plumed gromacs
+CPU full-stack stages : fftw plumed gromacs
+GROMACS-only stages   : fftw gromacs
 
 Selected environment overrides (export before running):
   OPENMPI_VERSION FFTW_VERSION BOOST_VERSION FMT_VERSION SPDLOG_VERSION ARRAYFIRE_VERSION
-  PLUMED_REPO GROMACS_VERSION GROMACS_URL GROMACS_FTP_URL PLUMED_GROMACS_PATCH
-  GMX_SIMD MARCH AUTO_REPAIR CUDA_SHIM_DIR CUDA_EXTRA_INCLUDE_DIRS CUDA_EXTRA_LIB_DIRS
+  PLUMED_REPO GROMACS_VERSION GROMACS_URL GROMACS_FTP_URL PLUMED_GROMACS_PATCH SOURCE_CACHE
+  MPI_PROVIDER MPI_PREFIX MPI_RUNTIME_TIMEOUT ARRAYFIRE_FULL_SOURCE_URL
+  GMX_SIMD MARCH ACCELERATOR AUTO_REPAIR CUDA_SHIM_DIR CUDA_EXTRA_INCLUDE_DIRS CUDA_EXTRA_LIB_DIRS
 
 Examples:
   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv
+  ./af_plumed_gmx_build.sh --dir /shared/public/build --work-dir $HOME/gmx-work --name myenv \
+      --source-cache $HOME/gmx-sources --toolchain-dir $HOME/gmx-toolchain
   ./af_plumed_gmx_build.sh --dir $HOME/sw --name plumed_a100 --arch 80 -j 32 --write-bashrc
   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --from gromacs    # continue after PLUMED
   mkdir -p $HOME/software/myenv/plumed_patch
@@ -397,6 +515,12 @@ Examples:
   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --update-saxs --dry-run
   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --update-saxs -j 4
   ./af_plumed_gmx_build.sh --dir $HOME/software --name gmx_gpu --gromacs-only --write-bashrc
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name gmx_cpu --gromacs-only --cpu-only
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name gmx_plumed_cpu --cpu-only
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name gmx_plumed_site_mpi \
+      --use-system-mpi --mpi-prefix /path/to/site/openmpi
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name gmx_plumed_site_mpi \
+      --use-system-mpi --mpi-prefix /path/to/site/openmpi --finalize-only
   ./af_plumed_gmx_build.sh --dir $HOME/builds --name gmx25 --gromacs-only \
       --install-cuda --cuda-version 12.6.3 --install-cmake \
       --toolchain-dir $HOME/software/toolchain --arch 70
@@ -450,11 +574,107 @@ json_string() {
 
 is_full_stack()    { [[ "${BUILD_MODE}" == "full" ]]; }
 is_gromacs_only() { [[ "${BUILD_MODE}" == "gromacs-only" ]]; }
+is_cpu_only()     { [[ "${ACCELERATOR}" == "cpu" ]]; }
+is_cuda_backend() { [[ "${ACCELERATOR}" == "cuda" ]]; }
+using_system_mpi() { [[ "${MPI_PROVIDER}" == "system" ]]; }
+
+canonical_executable() {
+  local x="${1:-}" p
+  [[ -n "${x}" ]] || return 1
+  p="$(command -v -- "${x}" 2>/dev/null || true)"
+  [[ -n "${p}" ]] || return 1
+  if command -v readlink >/dev/null 2>&1; then
+    readlink -f -- "${p}" 2>/dev/null || printf '%s\n' "${p}"
+  else
+    printf '%s\n' "${p}"
+  fi
+}
+
+resolve_build_compilers() {
+  local cc_sel cxx_sel fc_sel host_sel
+  cc_sel="${REQUESTED_CC:-${CC:-gcc}}"
+  cxx_sel="${REQUESTED_CXX:-${CXX:-g++}}"
+  BUILD_CC="$(canonical_executable "${cc_sel}" || true)"
+  BUILD_CXX="$(canonical_executable "${cxx_sel}" || true)"
+  [[ -x "${BUILD_CC}" ]] || die "Selected C compiler is not runnable: ${cc_sel}"
+  [[ -x "${BUILD_CXX}" ]] || die "Selected C++ compiler is not runnable: ${cxx_sel}"
+  export CC="${BUILD_CC}" CXX="${BUILD_CXX}"
+
+  fc_sel="${REQUESTED_FC:-${FC:-}}"
+  if [[ -n "${fc_sel}" ]]; then
+    BUILD_FC="$(canonical_executable "${fc_sel}" || true)"
+    [[ -x "${BUILD_FC}" ]] || die "Selected Fortran compiler is not runnable: ${fc_sel}"
+    export FC="${BUILD_FC}"
+  fi
+
+  if is_cuda_backend; then
+    host_sel="${REQUESTED_CUDAHOSTCXX:-${CUDAHOSTCXX:-${BUILD_CXX}}}"
+    BUILD_CUDAHOSTCXX="$(canonical_executable "${host_sel}" || true)"
+    [[ -x "${BUILD_CUDAHOSTCXX}" ]] || die "Selected CUDA host C++ compiler is not runnable: ${host_sel}"
+    export CUDAHOSTCXX="${BUILD_CUDAHOSTCXX}"
+  else
+    BUILD_CUDAHOSTCXX=""
+  fi
+}
+
+compiler_family() {
+  local out base
+  out="$("${1}" --version 2>/dev/null | head -n1 || true)"
+  base="$(basename -- "${1}")"
+  case "${base}:${out}" in
+    *[Cc]lang*) printf '%s\n' clang ;;
+    *gcc*|*g++*|*GCC*|*GNU*) printf '%s\n' gcc ;;
+    *) printf '%s\n' other ;;
+  esac
+}
+
+gromacs_effective_cxx_compiler() {
+  # Full CUDA/PLUMED builds use the locally installed OpenMPI C++ wrapper.
+  # During a fresh build that wrapper does not exist yet, so validate the
+  # selected build compiler; during a resumed build validate the compiler
+  # GROMACS will actually see through mpicxx.
+  if ! is_cpu_only && ! is_gromacs_only && [[ -x "${MPI_ROOT}/bin/mpicxx" ]]; then
+    printf '%s\n' "${MPI_ROOT}/bin/mpicxx"
+  else
+    printf '%s\n' "${BUILD_CXX}"
+  fi
+}
+
+validate_gromacs_2025_compiler() {
+  [[ "${GROMACS_VERSION}" == 2025* ]] || return 0
+  local compiler family ver min
+  compiler="$(gromacs_effective_cxx_compiler)"
+  family="$(compiler_family "${compiler}")"
+  ver="$(compiler_version_string "${compiler}")"
+  case "${family}" in
+    gcc) min="11" ;;
+    clang) min="14" ;;
+    *)
+      warn "Could not classify compiler '${compiler}' for an early GROMACS 2025 compatibility check; GROMACS CMake will perform the authoritative check."
+      return 0
+      ;;
+  esac
+  [[ -n "${ver}" ]] || { warn "Could not determine compiler version for ${compiler}; deferring to GROMACS CMake."; return 0; }
+  version_ge "${ver}" "${min}" \
+    || die "GROMACS ${GROMACS_VERSION} requires ${family} >=${min}, but ${compiler} reports ${ver}. Select a newer compiler with CC/CXX before rebuilding."
+  ok "Compiler compatibility check passed for GROMACS ${GROMACS_VERSION}: ${family} ${ver} (${compiler})."
+}
 
 configure_build_mode() {
+  case "${ACCELERATOR}" in
+    cuda|cpu) ;;
+    *) die "Invalid accelerator '${ACCELERATOR}'. Use cuda (default) or --cpu-only." ;;
+  esac
+
   case "${BUILD_MODE}" in
     full)
-      STAGES=("${FULL_STAGES[@]}")
+      if is_cpu_only; then
+        STAGES=("${CPU_FULL_STAGES[@]}")
+      elif using_system_mpi; then
+        STAGES=("${SYSTEM_MPI_FULL_STAGES[@]}")
+      else
+        STAGES=("${FULL_STAGES[@]}")
+      fi
       ;;
     gromacs-only|gromacs_only|gmx-only|gmx_only)
       BUILD_MODE="gromacs-only"
@@ -467,7 +687,7 @@ configure_build_mode() {
 }
 
 gmx_executable_name() {
-  if is_gromacs_only; then printf '%s\n' gmx; else printf '%s\n' gmx_mpi; fi
+  if is_gromacs_only || is_cpu_only; then printf '%s\n' gmx; else printf '%s\n' gmx_mpi; fi
 }
 
 is_valid_stage() {
@@ -485,10 +705,398 @@ stage_index() {
   return 1
 }
 
+###############################################################################
+# v34.1 offline source cache
+###############################################################################
+resolve_source_cache_path() {
+  [[ "${PREFETCH}" -eq 1 || "${OFFLINE}" -eq 1 || -n "${SOURCE_CACHE}" ]] || return 0
+  if [[ -z "${SOURCE_CACHE}" ]]; then
+    if [[ -n "${WORK_DIR}" ]]; then
+      SOURCE_CACHE="${WORK_DIR%/}/source_cache"
+    else
+      SOURCE_CACHE="${DIR%/}/source_cache"
+    fi
+  fi
+  SOURCE_CACHE="$(abspath "${SOURCE_CACHE}")"
+  SOURCE_CACHE_MANIFEST="${SOURCE_CACHE}/manifest.tsv"
+  SOURCE_CACHE_SHA256="${SOURCE_CACHE}/SHA256SUMS"
+}
+
+source_cache_archive_path() {
+  printf '%s\n' "${SOURCE_CACHE}/archives/${1}"
+}
+
+source_cache_git_path() {
+  printf '%s\n' "${SOURCE_CACHE}/git/${1}.tar.gz"
+}
+
+source_cache_relpath() {
+  local x="${1}"
+  printf '%s\n' "${x#${SOURCE_CACHE}/}"
+}
+
+source_cache_copy_archive() {
+  # source_cache_copy_archive <cache-filename> <destination>
+  local fname="${1}" out="${2}" cached
+  [[ "${OFFLINE}" -eq 1 ]] || return 1
+  cached="$(source_cache_archive_path "${fname}")"
+  [[ -s "${cached}" ]] || die "Offline source cache is missing archive: ${cached}"
+  cp -f -- "${cached}" "${out}"
+  [[ -s "${out}" ]] || die "Failed to copy cached archive ${cached} -> ${out}"
+  info "Offline source: ${cached} -> ${out}"
+}
+
+source_cache_extract_git() {
+  # source_cache_extract_git <component> <cache-key> <destination-directory>
+  local component="${1}" key="${2}" dest="${3}" cached parent expected expected_commit actual_commit
+  cached="$(source_cache_git_path "${key}")"
+  [[ -s "${cached}" ]] || die "Offline source cache is missing Git snapshot: ${cached}"
+  parent="$(dirname "${dest}")"
+  expected="$(basename "${dest}")"
+  mkdir -p "${parent}"
+  rm -rf -- "${dest}"
+  tar -xzf "${cached}" -C "${parent}"
+  [[ -d "${dest}" ]] || die "Cached Git snapshot ${cached} did not extract the expected directory '${expected}'."
+  expected_commit="$(awk -F '\t' -v c="${component}" '$1==c && $2=="git" {print $6; exit}' "${SOURCE_CACHE_MANIFEST}" 2>/dev/null || true)"
+  actual_commit="$(git -C "${dest}" rev-parse HEAD 2>/dev/null || true)"
+  [[ -n "${expected_commit}" && "${actual_commit}" == "${expected_commit}" ]] \
+    || die "Cached Git snapshot commit mismatch for ${component}: manifest=${expected_commit:-missing}, extracted=${actual_commit:-missing}"
+  info "Offline Git snapshot restored: ${cached} -> ${dest} (commit ${actual_commit})"
+}
+
+source_cache_required_files() {
+  local us cmake_tag
+  # All routes need FFTW + GROMACS.
+  printf '%s\n' "archives/fftw-${FFTW_VERSION}.tar.gz"
+  printf '%s\n' "archives/gromacs-${GROMACS_VERSION}.tar.gz"
+
+  if is_full_stack; then
+    if is_cpu_only; then
+      printf '%s\n' "git/plumed2.tar.gz"
+    else
+      us="${BOOST_VERSION//./_}"
+      if ! using_system_mpi; then
+        printf '%s\n' "archives/openmpi-${OPENMPI_VERSION}.tar.gz"
+      fi
+      printf '%s\n' "archives/boost_${us}.tar.gz"
+      printf '%s\n' "git/fmt-${FMT_VERSION}.tar.gz"
+      printf '%s\n' "git/spdlog-${SPDLOG_VERSION}.tar.gz"
+      printf '%s\n' "git/arrayfire-${ARRAYFIRE_VERSION}.tar.gz"
+      printf '%s\n' "git/plumed2.tar.gz"
+    fi
+  fi
+
+  if [[ "${INSTALL_CMAKE}" -eq 1 && -z "${CMAKE_ARCHIVE}" ]]; then
+    cmake_tag="$(cmake_platform_tag)"
+    printf '%s\n' "archives/cmake-${CMAKE_BOOTSTRAP_VERSION}-${cmake_tag}.tar.gz"
+  fi
+}
+
+verify_source_cache() {
+  [[ "${OFFLINE}" -eq 1 ]] || return 0
+  [[ -d "${SOURCE_CACHE}" ]] || die "Offline source cache directory not found: ${SOURCE_CACHE}"
+  [[ -s "${SOURCE_CACHE_MANIFEST}" ]] || die "Offline source cache provenance manifest not found: ${SOURCE_CACHE_MANIFEST}"
+  [[ -s "${SOURCE_CACHE_SHA256}" ]] || die "Offline source cache checksum manifest not found: ${SOURCE_CACHE_SHA256}"
+
+  local rel cached_ref cached_repo
+  while IFS= read -r rel; do
+    [[ -n "${rel}" ]] || continue
+    [[ -s "${SOURCE_CACHE}/${rel}" ]] || die "Offline source cache is incomplete; missing ${SOURCE_CACHE}/${rel}"
+    grep -Fq "  ${rel}" "${SOURCE_CACHE_SHA256}" \
+      || die "Offline source cache has no SHA-256 record for ${rel}"
+  done < <(source_cache_required_files)
+  grep -Fq "  manifest.tsv" "${SOURCE_CACHE_SHA256}" \
+    || die "Offline source cache does not protect manifest.tsv with SHA-256."
+
+  if ! (cd "${SOURCE_CACHE}" && sha256sum -c "$(basename "${SOURCE_CACHE_SHA256}")"); then
+    die "Offline source cache SHA-256 verification failed: ${SOURCE_CACHE_SHA256}"
+  fi
+  ok "Offline source cache SHA-256 verification passed."
+
+  if is_full_stack; then
+    cached_ref="$(awk -F '\t' '$1=="plumed" && $2=="git" {print $3; exit}' "${SOURCE_CACHE_MANIFEST}" || true)"
+    [[ "${cached_ref}" == "${PLUMED_REF}" ]] \
+      || die "Cached PLUMED ref mismatch: requested '${PLUMED_REF}', cache contains '${cached_ref:-missing}'. Re-run --prefetch with the requested ref."
+    cached_repo="$(awk -F '\t' '$1=="# plumed_repo" {print $2; exit}' "${SOURCE_CACHE_MANIFEST}" || true)"
+    [[ -z "${cached_repo}" || "${cached_repo}" == "${PLUMED_REPO}" ]] \
+      || die "Cached PLUMED repository mismatch: requested '${PLUMED_REPO}', cache contains '${cached_repo}'."
+    ok "Cached PLUMED provenance matches requested ref '${PLUMED_REF}'."
+  fi
+}
+
+prefetch_download_first_available() {
+  # prefetch_download_first_available <output> <url1> [url2 ...]
+  local out="${1}" url
+  shift
+  mkdir -p "$(dirname "${out}")"
+  for url in "$@"; do
+    info "Prefetching $(basename "${out}") from ${url}"
+    rm -f -- "${out}.part"
+    if command -v wget >/dev/null 2>&1; then
+      if wget -c -O "${out}.part" "${url}"; then mv "${out}.part" "${out}"; return 0; fi
+    elif command -v curl >/dev/null 2>&1; then
+      if curl -fL -C - -o "${out}.part" "${url}"; then mv "${out}.part" "${out}"; return 0; fi
+    else
+      die "Neither wget nor curl is available to prefetch ${url}"
+    fi
+    rm -f -- "${out}.part"
+    warn "Prefetch failed from ${url}; trying the next source if available."
+  done
+  die "Could not prefetch $(basename "${out}") from any configured source."
+}
+
+prefetch_archive() {
+  # prefetch_archive <component> <version> <filename> <url1> [url2 ...]
+  local component="${1}" version="${2}" fname="${3}" out
+  shift 3
+  out="$(source_cache_archive_path "${fname}")"
+  if [[ -s "${out}" ]]; then
+    if tar -tf "${out}" >/dev/null 2>&1; then
+      info "Reusing valid cached archive: ${out}"
+    else
+      warn "Cached archive is unreadable; downloading it again: ${out}"
+      rm -f -- "${out}"
+    fi
+  fi
+  if [[ ! -s "${out}" ]]; then
+    prefetch_download_first_available "${out}" "$@"
+  fi
+  tar -tf "${out}" >/dev/null 2>&1 || die "Prefetched archive is not readable by tar: ${out}"
+  printf '%s\tarchive\t%s\t%s\t%s\t-\n' \
+    "${component}" "${version}" "$(source_cache_relpath "${out}")" "$(sha256_file "${out}")" \
+    >> "${SOURCE_CACHE_MANIFEST}.body"
+  ok "Prefetched ${component} ${version}: ${out}"
+}
+
+prefetch_git_snapshot() {
+  # prefetch_git_snapshot <component> <cache-key> <url> <ref> <mode>
+  # mode: shallow-branch | recursive-branch | recursive-checkout
+  local component="${1}" key="${2}" url="${3}" ref="${4}" mode="${5}"
+  local work_parent work dest out commit status
+  work_parent="$(mktemp -d "${SOURCE_CACHE}/.prefetch-git.XXXXXX")"
+  work="${work_parent}/${key}"
+  out="$(source_cache_git_path "${key}")"
+  mkdir -p "$(dirname "${out}")"
+
+  case "${mode}" in
+    shallow-branch)
+      git clone --branch "${ref}" --depth 1 "${url}" "${work}"
+      ;;
+    recursive-branch)
+      git clone --recursive --branch "${ref}" "${url}" "${work}"
+      git -C "${work}" submodule update --init --recursive
+      ;;
+    recursive-checkout)
+      git clone --recursive "${url}" "${work}"
+      if [[ "${ref}" != "master" ]]; then
+        git -C "${work}" checkout "${ref}"
+      fi
+      git -C "${work}" submodule update --init --recursive
+      ;;
+    *)
+      rm -rf "${work_parent}"
+      die "Unknown prefetch Git mode '${mode}' for ${component}."
+      ;;
+  esac
+
+  commit="$(git -C "${work}" rev-parse HEAD)"
+  status="$(git -C "${work}" status --porcelain --untracked-files=all || true)"
+  [[ -z "${status}" ]] || { printf '%s\n' "${status}" >&2; rm -rf "${work_parent}"; die "Prefetched ${component} Git tree is not clean."; }
+
+  rm -f -- "${out}"
+  tar -czf "${out}" -C "${work_parent}" "${key}"
+  tar -tzf "${out}" >/dev/null 2>&1 || { rm -rf "${work_parent}"; die "Could not validate Git snapshot archive ${out}."; }
+  rm -rf "${work_parent}"
+  printf '%s\tgit\t%s\t%s\t%s\t%s\n' \
+    "${component}" "${ref}" "$(source_cache_relpath "${out}")" "$(sha256_file "${out}")" "${commit}" \
+    >> "${SOURCE_CACHE_MANIFEST}.body"
+  ok "Prefetched ${component} Git snapshot at commit ${commit}: ${out}"
+}
+
+arrayfire_offline_required_dirs() {
+  printf '%s\n' \
+    af_forge-src \
+    af_glad-src \
+    af_assets-src \
+    af_threads-src \
+    af_test_data-src \
+    googletest-src \
+    span-lite-src \
+    spdlog-src
+}
+
+validate_arrayfire_full_tree() {
+  # validate_arrayfire_full_tree <arrayfire-source-root>
+  local root="${1}" d missing=()
+  while IFS= read -r d; do
+    [[ -d "${root}/extern/${d}" ]] || missing+=("${d}")
+  done < <(arrayfire_offline_required_dirs)
+  [[ ${#missing[@]} -eq 0 ]] \
+    || die "ArrayFire full-source payload is incomplete under ${root}/extern; missing: ${missing[*]}"
+  ok "ArrayFire full-source offline dependency payload is complete."
+}
+
+prefetch_arrayfire_snapshot() {
+  local key="arrayfire-${ARRAYFIRE_VERSION}"
+  local work_parent work out commit tracked
+  local full_name="arrayfire-full-${ARRAYFIRE_VERSION}.tar.bz2"
+  local full_out full_extract full_root
+  local -a urls=()
+
+  work_parent="$(mktemp -d "${SOURCE_CACHE}/.prefetch-arrayfire.XXXXXX")"
+  work="${work_parent}/${key}"
+  out="$(source_cache_git_path "${key}")"
+  full_out="$(source_cache_archive_path "${full_name}")"
+  full_extract="${work_parent}/full"
+  mkdir -p "$(dirname "${out}")" "$(dirname "${full_out}")" "${full_extract}"
+
+  git clone --recursive --branch "v${ARRAYFIRE_VERSION}" \
+    https://github.com/arrayfire/arrayfire.git "${work}"
+  git -C "${work}" submodule update --init --recursive
+  commit="$(git -C "${work}" rev-parse HEAD)"
+
+  if [[ -n "${ARRAYFIRE_FULL_SOURCE_URL}" ]]; then
+    urls+=("${ARRAYFIRE_FULL_SOURCE_URL}")
+  else
+    urls+=(
+      "https://github.com/arrayfire/arrayfire/releases/download/v${ARRAYFIRE_VERSION}/${full_name}"
+      "https://sourceforge.net/projects/arrayfire.mirror/files/v${ARRAYFIRE_VERSION}/${full_name}/download"
+    )
+  fi
+  if [[ ! -s "${full_out}" ]] || ! tar -tf "${full_out}" >/dev/null 2>&1; then
+    rm -f -- "${full_out}"
+    prefetch_download_first_available "${full_out}" "${urls[@]}"
+  else
+    info "Reusing valid cached ArrayFire full-source archive: ${full_out}"
+  fi
+  tar -tf "${full_out}" >/dev/null 2>&1 \
+    || { rm -rf "${work_parent}"; die "ArrayFire full-source archive is unreadable: ${full_out}"; }
+
+  tar -xf "${full_out}" -C "${full_extract}"
+  full_root="$(find "${full_extract}" -mindepth 1 -maxdepth 2 -type d -name extern -print -quit | xargs -r dirname)"
+  [[ -n "${full_root}" && -d "${full_root}/extern" ]] \
+    || { rm -rf "${work_parent}"; die "Could not locate extern/ in ${full_out}."; }
+  cp -a "${full_root}/extern/." "${work}/extern/"
+  validate_arrayfire_full_tree "${work}"
+
+  tracked="$(git -C "${work}" status --porcelain --untracked-files=no || true)"
+  [[ -z "${tracked}" ]] \
+    || { printf '%s\n' "${tracked}" >&2; rm -rf "${work_parent}"; die "ArrayFire full-source overlay modified tracked v${ARRAYFIRE_VERSION} sources."; }
+
+  rm -f -- "${out}"
+  tar -czf "${out}" -C "${work_parent}" "${key}"
+  tar -tzf "${out}" >/dev/null 2>&1 \
+    || { rm -rf "${work_parent}"; die "Could not validate composite ArrayFire snapshot ${out}."; }
+  rm -rf "${work_parent}"
+
+  printf '%s\tarchive\t%s\t%s\t%s\t-\n' \
+    "arrayfire-full" "${ARRAYFIRE_VERSION}" "$(source_cache_relpath "${full_out}")" "$(sha256_file "${full_out}")" \
+    >> "${SOURCE_CACHE_MANIFEST}.body"
+  printf '%s\tgit\t%s\t%s\t%s\t%s\n' \
+    "arrayfire" "v${ARRAYFIRE_VERSION}" "$(source_cache_relpath "${out}")" "$(sha256_file "${out}")" "${commit}" \
+    >> "${SOURCE_CACHE_MANIFEST}.body"
+  ok "Prefetched composite ArrayFire ${ARRAYFIRE_VERSION} snapshot at commit ${commit}: ${out}"
+}
+
+write_source_cache_checksums() {
+  local f rel
+  : > "${SOURCE_CACHE_SHA256}"
+  while IFS= read -r f; do
+    [[ -f "${f}" ]] || continue
+    rel="$(source_cache_relpath "${f}")"
+    printf '%s  %s\n' "$(sha256_file "${f}")" "${rel}" >> "${SOURCE_CACHE_SHA256}"
+  done < <( { find "${SOURCE_CACHE}/archives" "${SOURCE_CACHE}/git" -maxdepth 1 -type f 2>/dev/null; printf '%s\n' "${SOURCE_CACHE_MANIFEST}"; } | sort )
+}
+
+prefetch_sources() {
+  section "Source cache prefetch"
+  mkdir -p "${SOURCE_CACHE}/archives" "${SOURCE_CACHE}/git"
+  : > "${SOURCE_CACHE_MANIFEST}.body"
+
+  local series us cmake_tag cmake_name plumed_commit
+
+  if is_full_stack && ! is_cpu_only && ! using_system_mpi; then
+    series="$(printf '%s' "${OPENMPI_VERSION}" | cut -d. -f1,2)"
+    prefetch_archive openmpi "${OPENMPI_VERSION}" "openmpi-${OPENMPI_VERSION}.tar.gz" \
+      "https://download.open-mpi.org/release/open-mpi/v${series}/openmpi-${OPENMPI_VERSION}.tar.gz"
+  fi
+
+  prefetch_archive fftw "${FFTW_VERSION}" "fftw-${FFTW_VERSION}.tar.gz" \
+    "https://www.fftw.org/fftw-${FFTW_VERSION}.tar.gz"
+
+  if is_full_stack && ! is_cpu_only; then
+    us="${BOOST_VERSION//./_}"
+    prefetch_archive boost "${BOOST_VERSION}" "boost_${us}.tar.gz" \
+      "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${us}.tar.gz"
+
+    prefetch_git_snapshot fmt "fmt-${FMT_VERSION}" \
+      "https://github.com/fmtlib/fmt.git" "${FMT_VERSION}" shallow-branch
+    prefetch_git_snapshot spdlog "spdlog-${SPDLOG_VERSION}" \
+      "https://github.com/gabime/spdlog.git" "v${SPDLOG_VERSION}" shallow-branch
+    prefetch_arrayfire_snapshot
+  fi
+
+  if is_full_stack; then
+    prefetch_git_snapshot plumed "plumed2" "${PLUMED_REPO}" "${PLUMED_REF}" recursive-checkout
+    plumed_commit="$(tar -xOf "$(source_cache_git_path plumed2)" plumed2/.git/HEAD 2>/dev/null | head -n1 || true)"
+    : "${plumed_commit}"  # provenance is already recorded by prefetch_git_snapshot
+  fi
+
+  prefetch_archive gromacs "${GROMACS_VERSION}" "gromacs-${GROMACS_VERSION}.tar.gz" \
+    "${GROMACS_URL}" "${GROMACS_FTP_URL}"
+
+  if [[ "${INSTALL_CMAKE}" -eq 1 ]]; then
+    if [[ -n "${CMAKE_ARCHIVE}" ]]; then
+      info "--cmake-archive already supplies a local CMake archive; it is not duplicated in the source cache."
+    else
+      cmake_tag="$(cmake_platform_tag)"
+      cmake_name="cmake-${CMAKE_BOOTSTRAP_VERSION}-${cmake_tag}.tar.gz"
+      [[ -n "${CMAKE_DOWNLOAD_URL}" ]] || CMAKE_DOWNLOAD_URL="https://github.com/Kitware/CMake/releases/download/v${CMAKE_BOOTSTRAP_VERSION}/${cmake_name}"
+      prefetch_archive cmake "${CMAKE_BOOTSTRAP_VERSION}" "${cmake_name}" "${CMAKE_DOWNLOAD_URL}"
+    fi
+  fi
+
+  # Append archive provenance after all downloads.
+  {
+    printf '# schema\t2\n'
+    printf '# installer\t%s\n' "${SCRIPT_VERSION}"
+    printf '# generated_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '# build_mode\t%s\n' "${BUILD_MODE}"
+    printf '# accelerator\t%s\n' "${ACCELERATOR}"
+    printf '# gromacs_version\t%s\n' "${GROMACS_VERSION}"
+    printf '# plumed_ref\t%s\n' "${PLUMED_REF}"
+    printf '# plumed_repo\t%s\n' "${PLUMED_REPO}"
+    printf '# mpi_provider\t%s\n' "${MPI_PROVIDER}"
+    printf 'component\tkind\tversion_or_ref\tartifact\tsha256\tgit_commit\n'
+    [[ -s "${SOURCE_CACHE_MANIFEST}.body" ]] && cat "${SOURCE_CACHE_MANIFEST}.body"
+  } > "${SOURCE_CACHE_MANIFEST}"
+  rm -f -- "${SOURCE_CACHE_MANIFEST}.body"
+
+  write_source_cache_checksums
+  (cd "${SOURCE_CACHE}" && sha256sum -c "$(basename "${SOURCE_CACHE_SHA256}")") \
+    || die "Newly generated source cache failed its own SHA-256 verification."
+  ok "Source cache ready: ${SOURCE_CACHE}"
+  info "Manifest : ${SOURCE_CACHE_MANIFEST}"
+  info "Checksums: ${SOURCE_CACHE_SHA256}"
+}
+
+prepare_offline_cmake_archive() {
+  [[ "${OFFLINE}" -eq 1 && "${INSTALL_CMAKE}" -eq 1 && -z "${CMAKE_ARCHIVE}" ]] || return 0
+  local tag fname
+  tag="$(cmake_platform_tag)"
+  fname="cmake-${CMAKE_BOOTSTRAP_VERSION}-${tag}.tar.gz"
+  CMAKE_ARCHIVE="$(source_cache_archive_path "${fname}")"
+  [[ -s "${CMAKE_ARCHIVE}" ]] || die "Offline CMake archive missing from source cache: ${CMAKE_ARCHIVE}"
+}
+
 # Download helper: prefers wget, falls back to curl. Saves to basename in cwd.
 download() {
   local url="${1}" fname
   fname="$(basename "${url}")"
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    source_cache_copy_archive "${fname}" "${fname}"
+    return 0
+  fi
   if [[ -f "${fname}" ]]; then
     info "Archive ${fname} already present; resuming/validating download."
   fi
@@ -503,8 +1111,13 @@ download() {
 
 download_to() {
   # download_to <url> <output-file>
-  local url="${1}" out="${2}"
+  local url="${1}" out="${2}" fname
   mkdir -p "$(dirname "${out}")"
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    fname="$(basename "${url}")"
+    source_cache_copy_archive "${fname}" "${out}"
+    return 0
+  fi
   if [[ -s "${out}" ]]; then
     info "Using cached download: ${out}"
     return 0
@@ -523,6 +1136,10 @@ download_first_available() {
   # download_first_available <output-filename> <url1> [url2 ...]
   local fname="${1}" url
   shift
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    source_cache_copy_archive "${fname}" "${fname}"
+    return 0
+  fi
   if [[ $# -lt 1 ]]; then
     die "download_first_available needs at least one URL."
   fi
@@ -551,6 +1168,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "${1}" in
       --gromacs-only) BUILD_MODE="gromacs-only"; BUILD_MODE_EXPLICIT=1; shift ;;
+      --cpu-only)     ACCELERATOR="cpu"; shift ;;
       --full-stack)   BUILD_MODE="full"; BUILD_MODE_EXPLICIT=1; shift ;;
       --mode)         BUILD_MODE="${2:?--mode requires full or gromacs-only}"; BUILD_MODE_EXPLICIT=1; shift 2 ;;
       --mode=*)       BUILD_MODE="${1#*=}"; BUILD_MODE_EXPLICIT=1; shift ;;
@@ -558,6 +1176,8 @@ parse_args() {
       --cuda=*)       CUDA_PATH="${1#*=}"; shift ;;
       --dir)          DIR="${2:?--dir requires a path}"; shift 2 ;;
       --dir=*)        DIR="${1#*=}"; shift ;;
+      --work-dir)     WORK_DIR="${2:?--work-dir requires a path}"; WORK_DIR_EXPLICIT=1; shift 2 ;;
+      --work-dir=*)   WORK_DIR="${1#*=}"; WORK_DIR_EXPLICIT=1; shift ;;
       --name)         NAME="${2:?--name requires a value}"; shift 2 ;;
       --name=*)       NAME="${1#*=}"; shift ;;
       -j|--jobs)      NPROC="${2:?--jobs requires a number}"; shift 2 ;;
@@ -574,6 +1194,13 @@ parse_args() {
       --gromacs-patch=*) PLUMED_GROMACS_PATCH="${1#*=}"; shift ;;
       --gmx-simd)     GMX_SIMD="${2:?--gmx-simd requires a value}"; shift 2 ;;
       --gmx-simd=*)   GMX_SIMD="${1#*=}"; shift ;;
+      --use-system-mpi) MPI_PROVIDER="system"; MPI_PROVIDER_EXPLICIT=1; shift ;;
+      --mpi-prefix)   MPI_PREFIX="${2:?--mpi-prefix requires a path}"; MPI_PROVIDER="system"; MPI_PROVIDER_EXPLICIT=1; MPI_PREFIX_EXPLICIT=1; shift 2 ;;
+      --mpi-prefix=*) MPI_PREFIX="${1#*=}"; MPI_PROVIDER="system"; MPI_PROVIDER_EXPLICIT=1; MPI_PREFIX_EXPLICIT=1; shift ;;
+      --prefetch)     PREFETCH=1; CURRENT_OPERATION="prefetch"; shift ;;
+      --offline)      OFFLINE=1; shift ;;
+      --source-cache) SOURCE_CACHE="${2:?--source-cache requires a path}"; shift 2 ;;
+      --source-cache=*) SOURCE_CACHE="${1#*=}"; shift ;;
       --install-cuda) INSTALL_CUDA=1; shift ;;
       --cuda-version) CUDA_BOOTSTRAP_VERSION="${2:?--cuda-version requires a value}"; shift 2 ;;
       --cuda-version=*) CUDA_BOOTSTRAP_VERSION="${1#*=}"; shift ;;
@@ -614,6 +1241,7 @@ parse_args() {
       --write-bashrc) WRITE_BASHRC=1; shift ;;
       --write-aliases) WRITE_ALIASES=1; shift ;;
       --status)       DO_STATUS=1; shift ;;
+      --finalize-only) FINALIZE_ONLY=1; CURRENT_OPERATION="finalize"; shift ;;
       --dry-run)      DRY_RUN=1; shift ;;
       --no-color)     NO_COLOR=1; shift ;;
       -y|--yes)       ASSUME_YES=1; shift ;;
@@ -627,6 +1255,86 @@ parse_args() {
 
 validate_args() {
   [[ -n "${DIR}" ]] || { err "--dir is required."; usage; exit 2; }
+
+  case "${MPI_PROVIDER}" in
+    private|system) ;;
+    *) die "Invalid MPI provider '${MPI_PROVIDER}'. Use the default private provider or --use-system-mpi." ;;
+  esac
+  [[ "${MPI_RUNTIME_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] \
+    || die "MPI_RUNTIME_TIMEOUT must be a positive integer number of seconds (got: ${MPI_RUNTIME_TIMEOUT})."
+  if using_system_mpi; then
+    is_full_stack || die "--use-system-mpi is only valid for the full PLUMED/GROMACS route. GROMACS-only uses built-in thread-MPI."
+    is_cuda_backend || die "--use-system-mpi is not used by --cpu-only; the CPU full-stack route uses built-in thread-MPI."
+  fi
+
+  if [[ "${FINALIZE_ONLY}" -eq 1 ]]; then
+    [[ -n "${NAME}" ]] || die "--finalize-only requires --name to select an existing installation explicitly."
+    [[ "${PREFETCH}" -eq 0 && "${UPDATE_SAXS}" -eq 0 && "${DO_STATUS}" -eq 0 ]] \
+      || die "--finalize-only cannot be combined with --prefetch, --update-saxs, or --status."
+    [[ -z "${FROM_STAGE}" && -z "${ONLY_STAGE}" && "${FORCE}" -eq 0 ]] \
+      || die "--finalize-only cannot be combined with --from, --only, or --force."
+    [[ "${INSTALL_CUDA}" -eq 0 && "${INSTALL_CMAKE}" -eq 0 ]] \
+      || die "--finalize-only validates an existing installation; do not combine it with --install-cuda/--install-cmake."
+    [[ "${DRY_RUN}" -eq 0 ]] || die "--finalize-only is already non-building and cannot be combined with --dry-run."
+  fi
+
+  [[ ! ( "${PREFETCH}" -eq 1 && "${OFFLINE}" -eq 1 ) ]] \
+    || die "--prefetch and --offline are mutually exclusive."
+  if [[ "${PREFETCH}" -eq 1 ]]; then
+    [[ "${UPDATE_SAXS}" -eq 0 && "${DO_STATUS}" -eq 0 ]] \
+      || die "--prefetch cannot be combined with --update-saxs or --status."
+    [[ -z "${FROM_STAGE}" && -z "${ONLY_STAGE}" ]] \
+      || die "--prefetch creates a complete cache for the selected build route; do not combine it with --from/--only."
+    [[ "${WRITE_BASHRC}" -eq 0 && "${WRITE_ALIASES}" -eq 0 ]] \
+      || die "--prefetch does not modify shell aliases; omit --write-bashrc/--write-aliases."
+  fi
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    [[ "${UPDATE_SAXS}" -eq 0 ]] || die "--offline is not used by --update-saxs; that route reuses an existing source tree."
+    [[ "${INSTALL_CUDA}" -eq 0 ]] \
+      || die "Offline source cache does not provision a CUDA toolkit. Load/provide the site CUDA toolkit or use --cuda-runfile explicitly in a normal online run."
+    if is_full_stack; then
+      [[ "${PLUMED_DISABLE_PYTHON}" == "1" ]] \
+        || die "--offline currently requires PLUMED_DISABLE_PYTHON=1 (the default), so PLUMED cannot attempt a network pip/bootstrap operation."
+    fi
+  fi
+
+  case "${ACCELERATOR}" in
+    cuda|cpu) ;;
+    *) die "Invalid accelerator '${ACCELERATOR}'. Use the default CUDA backend or pass --cpu-only." ;;
+  esac
+
+  # -------------------------------------------------------------------------
+  # BOOKMARK: CPU-SAXS DEVELOPMENT/UPDATE SUPPORT IS INTENTIONALLY OUT OF SCOPE
+  # -------------------------------------------------------------------------
+  # The CPU profile is a lightweight analysis/login-node stack. It uses upstream
+  # PLUMED sources and must not silently enter the custom SAXS.cpp/ArrayFire
+  # development workflow. Revisit this block only after the custom SAXS.cpp has
+  # been separately compiled, scientifically validated, and regression-tested
+  # without ArrayFire/CUDA.
+  if is_cpu_only; then
+    [[ "${UPDATE_SAXS}" -eq 0 ]] \
+      || die "--cpu-only --update-saxs is intentionally unsupported. CPU support for the custom SAXS-development/update workflow is kept out of scope pending separate validation."
+    [[ "${INSTALL_CUDA}" -eq 0 ]] \
+      || die "--install-cuda is incompatible with --cpu-only."
+    [[ "${CUDA_PATH}" == "auto" ]] \
+      || die "--cuda is incompatible with --cpu-only."
+    [[ "${CUDA_BOOTSTRAP_VERSION}" == "auto" ]] \
+      || die "--cuda-version is incompatible with --cpu-only."
+    [[ -z "${CUDA_INSTALL_DIR}${CUDA_RUNFILE_URL}${CUDA_RUNFILE}" ]] \
+      || die "CUDA installation/runfile options are incompatible with --cpu-only."
+    [[ "${CUDA_DRIVER_VERSION}" == "auto" ]] \
+      || die "--cuda-driver-version is incompatible with --cpu-only."
+    [[ "${CUDA_ARCHS}" == "auto" ]] \
+      || die "--arch is incompatible with --cpu-only."
+    [[ "${CUDA_SHIM_DIR}" == "auto" ]] \
+      || die "--cuda-shim-dir is incompatible with --cpu-only."
+    if is_full_stack; then
+      [[ -z "${PLUMED_SAXS_CPP}" ]] \
+        || die "--saxs-cpp is intentionally unsupported with --cpu-only; CPU PLUMED uses upstream SAXS sources only."
+      [[ "${PLUMED_PATCH_DIR}" == "auto" ]] \
+        || die "--plumed-patch-dir is intentionally unsupported with --cpu-only; CPU PLUMED uses upstream SAXS sources only."
+    fi
+  fi
 
   if [[ "${UPDATE_SAXS}" -eq 1 ]]; then
     [[ "${INSTALL_CUDA}" -eq 0 && "${INSTALL_CMAKE}" -eq 0 ]] \
@@ -677,8 +1385,10 @@ validate_args() {
     [[ -z "${CUDA_RUNFILE_URL}" || -z "${CUDA_RUNFILE}" ]] \
       || die "Use only one of --cuda-runfile-url or --cuda-runfile."
   else
-    [[ "${CUDA_BOOTSTRAP_VERSION}" == "auto" ]] \
-      || warn "--cuda-version has no effect unless --install-cuda is used."
+    if is_cuda_backend; then
+      [[ "${CUDA_BOOTSTRAP_VERSION}" == "auto" ]] \
+        || warn "--cuda-version has no effect unless --install-cuda is used."
+    fi
     [[ -z "${CUDA_INSTALL_DIR}${CUDA_RUNFILE_URL}${CUDA_RUNFILE}" ]] \
       || die "--cuda-install-dir/--cuda-runfile-url/--cuda-runfile require --install-cuda."
   fi
@@ -697,9 +1407,6 @@ validate_args() {
   return 0
 }
 
-###############################################################################
-# Optional private toolchain bootstrap (v32)
-###############################################################################
 cuda_bootstrap_catalog_runfile_url() {
   # Deliberately curated. NVIDIA runfile filenames embed a driver build number,
   # so unknown versions must be supplied explicitly instead of guessed.
@@ -799,7 +1506,11 @@ resolve_toolchain_bootstrap() {
 
   DIR="$(abspath "${DIR}")"
   if [[ -z "${TOOLCHAIN_DIR}" ]]; then
-    TOOLCHAIN_DIR="${DIR%/}/toolchain"
+    if [[ -n "${WORK_DIR}" ]]; then
+      TOOLCHAIN_DIR="$(abspath "${WORK_DIR}")/toolchain"
+    else
+      TOOLCHAIN_DIR="${DIR%/}/toolchain"
+    fi
   else
     TOOLCHAIN_DIR="$(abspath "${TOOLCHAIN_DIR}")"
   fi
@@ -927,7 +1638,7 @@ print_toolchain_bootstrap_plan() {
   else
     printf '  %-24s : %s\n' "CMake bootstrap" "disabled"
   fi
-  if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
+if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
     printf '  %-24s : %s\n' "CUDA Toolkit" "${RESOLVED_CUDA_BOOTSTRAP_VERSION} -> ${CUDA_INSTALL_DIR}"
     printf '  %-24s : %s\n' "CUDA source" "${CUDA_RUNFILE:-${CUDA_RUNFILE_URL}}"
     printf '  %-24s : %s\n' "NVIDIA driver" "${RESOLVED_NVIDIA_DRIVER_VERSION} (existing; never modified)"
@@ -1056,6 +1767,29 @@ install_private_cuda() {
   CUDA_PATH="${CUDA_INSTALL_DIR}"
 }
 
+
+check_work_dir() {
+  [[ "${SPLIT_LAYOUT}" -eq 1 ]] || return 0
+  local marker="${WORK_ROOT}/.installer_install_root" recorded=""
+  if [[ -s "${marker}" ]]; then
+    recorded="$(head -n1 "${marker}" 2>/dev/null || true)"
+    [[ -z "${recorded}" || "$(abspath "${recorded}")" == "$(abspath "${INSTALL_ROOT}")" || "${FORCE}" -eq 1 ]] \
+      || die "Workspace ${WORK_ROOT} belongs to a different installation (${recorded}), not ${INSTALL_ROOT}. Choose another --work-dir/--name or pass --force only after inspection."
+  elif [[ -d "${WORK_ROOT}" && -n "$(ls -A "${WORK_ROOT}" 2>/dev/null)" ]]; then
+    if [[ "${FORCE}" -eq 1 || -n "${FROM_STAGE}" || -n "${ONLY_STAGE}" || "${ASSUME_YES}" -eq 1 ]]; then
+      warn "Reusing non-empty split workspace without ownership marker: ${WORK_ROOT}"
+    else
+      die "Workspace already exists and is non-empty but is not marked as belonging to this installation:\n    ${WORK_ROOT}\nChoose another --work-dir/--name, or inspect it and rerun with --yes/--force."
+    fi
+  fi
+}
+
+persist_workspace_profile() {
+  [[ "${SPLIT_LAYOUT}" -eq 1 ]] || return 0
+  mkdir -p "${WORK_ROOT}"
+  printf '%s\n' "${INSTALL_ROOT}" > "${WORK_ROOT}/.installer_install_root"
+  printf '%s\n' "${SCRIPT_VERSION}" > "${WORK_ROOT}/.installer_version"
+}
 
 ###############################################################################
 # CUDA detection
@@ -1286,7 +2020,11 @@ resolve_cuda_archs() {
 resolve_paths() {
   DIR="$(abspath "${DIR}")"
   if [[ -z "${NAME}" ]]; then
-    NAME="build_${CUDA_VERSION}"
+    if is_cpu_only; then
+      NAME="build_cpu"
+    else
+      NAME="build_${CUDA_VERSION}"
+    fi
   fi
 
   # Default parallel jobs to the core count (fall back to 1 if nproc is absent).
@@ -1302,9 +2040,17 @@ resolve_paths() {
   fi
 
   INSTALL_ROOT="${DIR%/}/${NAME}"
-  SRC="${INSTALL_ROOT}/src"
-  LOG_DIR="${INSTALL_ROOT}/build_logs"
-  CKPT_DIR="${INSTALL_ROOT}/.checkpoints"
+  if [[ -n "${WORK_DIR}" ]]; then
+    WORK_DIR="$(abspath "${WORK_DIR}")"
+    WORK_ROOT="${WORK_DIR%/}/${NAME}"
+    SPLIT_LAYOUT=1
+  else
+    WORK_ROOT="${INSTALL_ROOT}"
+    SPLIT_LAYOUT=0
+  fi
+  SRC="${WORK_ROOT}/src"
+  LOG_DIR="${WORK_ROOT}/build_logs"
+  CKPT_DIR="${WORK_ROOT}/.checkpoints"
 
   # Activation alias must be a valid shell identifier; sanitize if needed.
   if [[ "${NAME}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
@@ -1313,6 +2059,53 @@ resolve_paths() {
     ALIAS_NAME="$(printf '%s' "${NAME}" | sed 's/[^A-Za-z0-9_]/_/g')"
     [[ "${ALIAS_NAME}" =~ ^[A-Za-z_] ]] || ALIAS_NAME="env_${ALIAS_NAME}"
   fi
+}
+
+persist_install_profile() {
+  mkdir -p "${INSTALL_ROOT}"
+  printf '%s\n' "${BUILD_MODE}" > "${INSTALL_ROOT}/.installer_build_mode"
+  printf '%s\n' "${ACCELERATOR}" > "${INSTALL_ROOT}/.installer_accelerator"
+  printf '%s\n' "${MPI_PROVIDER}" > "${INSTALL_ROOT}/.installer_mpi_provider"
+  printf '%s\n' "${MPI_ROOT:-}" > "${INSTALL_ROOT}/.installer_mpi_prefix"
+  printf '%s\n' "$([[ "${OFFLINE}" -eq 1 ]] && echo offline || echo online)" > "${INSTALL_ROOT}/.installer_source_mode"
+  printf '%s\n' "${SOURCE_CACHE:-}" > "${INSTALL_ROOT}/.installer_source_cache"
+  printf '%s\n' "${WORK_DIR:-}" > "${INSTALL_ROOT}/.installer_work_parent"
+  printf '%s\n' "${WORK_ROOT:-${INSTALL_ROOT}}" > "${INSTALL_ROOT}/.installer_work_root"
+  printf '%s\n' "${PLUMED_REF:-}" > "${INSTALL_ROOT}/.installer_plumed_ref"
+  printf '%s\n' "${GROMACS_VERSION:-}" > "${INSTALL_ROOT}/.installer_gromacs_version"
+  printf '%s\n' "${PLUMED_DISABLE_PYTHON:-1}" > "${INSTALL_ROOT}/.installer_plumed_disable_python"
+}
+
+load_persisted_install_profile() {
+  local f value
+  f="${INSTALL_ROOT}/.installer_build_mode"
+  if [[ -s "${f}" ]]; then BUILD_MODE="$(head -n1 "${f}")"; fi
+  f="${INSTALL_ROOT}/.installer_accelerator"
+  if [[ -s "${f}" ]]; then ACCELERATOR="$(head -n1 "${f}")"; fi
+  f="${INSTALL_ROOT}/.installer_mpi_provider"
+  if [[ -s "${f}" ]]; then
+    value="$(head -n1 "${f}")"
+    [[ "${value}" == "private" || "${value}" == "system" ]] && MPI_PROVIDER="${value}"
+  fi
+  f="${INSTALL_ROOT}/.installer_mpi_prefix"
+  if [[ -s "${f}" && "${MPI_PREFIX_EXPLICIT}" -eq 0 ]]; then MPI_PREFIX="$(head -n1 "${f}")"; fi
+  f="${INSTALL_ROOT}/.installer_source_cache"
+  if [[ -s "${f}" && -z "${SOURCE_CACHE}" ]]; then SOURCE_CACHE="$(head -n1 "${f}")"; fi
+  f="${INSTALL_ROOT}/.installer_work_parent"
+  if [[ -s "${f}" ]]; then
+    value="$(head -n1 "${f}")"
+    if [[ "${WORK_DIR_EXPLICIT}" -eq 1 && -n "${value}" && "$(abspath "${WORK_DIR}")" != "$(abspath "${value}")" ]]; then
+      die "Requested --work-dir differs from the workspace recorded for this installation: requested=$(abspath "${WORK_DIR}"), recorded=$(abspath "${value}")."
+    fi
+    if [[ "${WORK_DIR_EXPLICIT}" -eq 0 ]]; then WORK_DIR="${value}"; fi
+  fi
+  f="${INSTALL_ROOT}/.installer_plumed_ref"
+  if [[ -s "${f}" ]]; then PLUMED_REF="$(head -n1 "${f}")"; fi
+  f="${INSTALL_ROOT}/.installer_gromacs_version"
+  if [[ -s "${f}" && "${GROMACS_VERSION}" == "auto" ]]; then GROMACS_VERSION="$(head -n1 "${f}")"; fi
+  f="${INSTALL_ROOT}/.installer_plumed_disable_python"
+  if [[ -s "${f}" ]]; then PLUMED_DISABLE_PYTHON="$(head -n1 "${f}")"; fi
+  configure_build_mode
 }
 
 ###############################################################################
@@ -1344,19 +2137,33 @@ should_run() {
 ###############################################################################
 check_install_dir() {
   local mode_marker="${INSTALL_ROOT}/.installer_build_mode"
+  local accel_marker="${INSTALL_ROOT}/.installer_accelerator"
   if [[ -f "${mode_marker}" ]]; then
     local existing_mode
     existing_mode="$(head -n1 "${mode_marker}" 2>/dev/null || true)"
     if [[ -n "${existing_mode}" && "${existing_mode}" != "${BUILD_MODE}" && "${FORCE}" -ne 1 ]]; then
-      die "Install root was created in build mode '${existing_mode}', but '${BUILD_MODE}' was requested:\n    ${INSTALL_ROOT}\nUse a new --name, or pass --force to replace/rebuild the selected route."
+      die "Install root was created in build mode '${existing_mode}', but '${BUILD_MODE}' was requested:
+    ${INSTALL_ROOT}
+Use a new --name, or pass --force to replace/rebuild the selected route."
     fi
   elif [[ -d "${CKPT_DIR}" ]] && is_gromacs_only && [[ "${FORCE}" -ne 1 ]]; then
     die "Existing checkpointed install has no build-mode marker and is assumed to be a legacy full-stack environment. Use a new --name for --gromacs-only, or pass --force."
   fi
 
+  if [[ -f "${accel_marker}" ]]; then
+    local existing_accel
+    existing_accel="$(head -n1 "${accel_marker}" 2>/dev/null || true)"
+    if [[ -n "${existing_accel}" && "${existing_accel}" != "${ACCELERATOR}" ]]; then
+      die "Install root was created with accelerator/backend '${existing_accel}', but '${ACCELERATOR}' was requested:
+    ${INSTALL_ROOT}
+Backend changes are not allowed in-place, even with --force; use a new --name to prevent stale CPU/GPU artifacts from mixing."
+    fi
+  elif [[ -d "${CKPT_DIR}" ]] && is_cpu_only; then
+    # v32.1 and older installs had no accelerator marker and were CUDA builds.
+    die "Existing checkpointed install has no accelerator marker and is conservatively assumed to be a legacy CUDA build. Use a new --name for --cpu-only; backend conversion in-place is intentionally refused."
+  fi
+
   if [[ -d "${INSTALL_ROOT}" ]] && [[ -n "$(ls -A "${INSTALL_ROOT}" 2>/dev/null)" ]]; then
-    # Non-empty. Allow if it is a previous run of this script (has checkpoints),
-    # or the user explicitly asked to resume/force.
     if [[ -d "${CKPT_DIR}" ]] || [[ "${FORCE}" -eq 1 ]] \
        || [[ -n "${FROM_STAGE}" ]] || [[ -n "${ONLY_STAGE}" ]] \
        || [[ "${ASSUME_YES}" -eq 1 ]]; then
@@ -1370,9 +2177,6 @@ or -y/--yes (reuse and keep checkpoints) to install into it anyway."
   fi
 }
 
-###############################################################################
-# Preflight (requirement #5)
-###############################################################################
 version_ge() {
   # version_ge A B  -> true if A >= B
   [[ "$(printf '%s\n%s\n' "${2}" "${1}" | sort -V | head -n1)" == "${2}" ]]
@@ -1591,17 +2395,30 @@ ensure_cuda_development_layout() {
   ok "CUDA hot headers/libraries available from ${CUDA_HOME}."
 }
 
+probe_private_openmpi_libnsl() {
+  # Advisory only. Some OpenMPI configurations discover/use libnsl, and on
+  # stripped HPC compute images the runtime lib may exist without the linker
+  # development symlink. Do not make this a portability requirement.
+  is_full_stack && is_cuda_backend && ! using_system_mpi || return 0
+  [[ -x "${BUILD_CC:-}" ]] || return 0
+  local tmp src exe
+  tmp="$(mktemp -d 2>/dev/null || mktemp -d -t af_nsl_probe)"
+  src="${tmp}/nsl_probe.c"
+  exe="${tmp}/nsl_probe"
+  printf '%s\n' 'int main(void){return 0;}' > "${src}"
+  if "${BUILD_CC}" "${src}" -lnsl -o "${exe}" >/dev/null 2>&1; then
+    ok "Optional libnsl linker probe passed for private OpenMPI."
+  else
+    warn "Optional '-lnsl' linker probe failed. This is not universally required, but some private OpenMPI configurations can fail late when libnsl development files are absent. If the site provides a supported MPI, consider --use-system-mpi instead of adding ad-hoc linker symlinks."
+  fi
+  rm -rf "${tmp}"
+}
+
 preflight() {
   section "Preflight checks"
 
-  # Under --dry-run we want to surface problems but still print the full plan,
-  # so downgrade otherwise-fatal checks to warnings.
   _pf_fail() {
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      warn "$1"
-    else
-      die "$1"
-    fi
+    if [[ "${DRY_RUN}" -eq 1 ]]; then warn "$1"; else die "$1"; fi
   }
 
   local missing=()
@@ -1611,7 +2428,7 @@ preflight() {
   for c in "${required_tools[@]}"; do
     command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
   done
-  if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+  if [[ "${OFFLINE}" -eq 0 ]] && ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
     missing+=("wget-or-curl")
   fi
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -1620,34 +2437,31 @@ On HPC, try 'module load' for the relevant compilers/cmake/git, or ask your admi
   else
     ok "Required tools present."
   fi
+  [[ -x "${BUILD_CC:-}" ]] || _pf_fail "Resolved C compiler is not runnable: ${BUILD_CC:-unset}"
+  [[ -x "${BUILD_CXX:-}" ]] || _pf_fail "Resolved C++ compiler is not runnable: ${BUILD_CXX:-unset}"
+  [[ ! -x "${BUILD_CC:-}" ]] || ok "C compiler: ${BUILD_CC} ($(${BUILD_CC} --version 2>/dev/null | head -n1 || true))"
+  [[ ! -x "${BUILD_CXX:-}" ]] || ok "C++ compiler: ${BUILD_CXX} ($(${BUILD_CXX} --version 2>/dev/null | head -n1 || true))"
+
+  probe_private_openmpi_libnsl
+
+  if is_full_stack && is_cuda_backend && using_system_mpi; then
+    validate_system_mpi_selection
+  fi
 
   if [[ "${INSTALL_CMAKE}" -eq 1 && "${DRY_RUN}" -eq 1 && ! -x "${CMAKE_INSTALL_DIR}/bin/cmake" ]]; then
     info "Private CMake ${CMAKE_BOOTSTRAP_VERSION} is scheduled at ${CMAKE_INSTALL_DIR}; system CMake is not required for this run."
   fi
 
-  # CMake version. ArrayFire can work with older CMake releases. GROMACS
-  # requirements depend on the selected branch: 2024.x needs 3.18.4+, while
-  # 2025.x needs 3.28+. In auto mode, keep preflight permissive because the
-  # GROMACS stage can fall back to 2024.6 on old GCC/G++ toolchains.
   if command -v cmake >/dev/null 2>&1; then
     local cmake_ver cmake_min cmake_msg
     cmake_ver="$(cmake --version | head -n1 | awk '{print $3}')"
     cmake_min="3.16"
-    cmake_msg="3.16+ is recommended for ArrayFire."
+    cmake_msg="3.16+ is recommended for the configured build route."
     if should_run gromacs; then
       case "${GROMACS_VERSION}" in
-        2025*)
-          cmake_min="3.28"
-          cmake_msg="GROMACS ${GROMACS_VERSION} needs CMake 3.28+."
-          ;;
-        2024*)
-          cmake_min="3.18.4"
-          cmake_msg="GROMACS ${GROMACS_VERSION} needs CMake 3.18.4+."
-          ;;
-        auto)
-          cmake_min="3.18.4"
-          cmake_msg="GROMACS auto mode needs CMake 3.18.4+ for the 2024 fallback; 2025.4 will additionally require 3.28+ if selected."
-          ;;
+        2025*) cmake_min="3.28"; cmake_msg="GROMACS ${GROMACS_VERSION} needs CMake 3.28+." ;;
+        2024*) cmake_min="3.18.4"; cmake_msg="GROMACS ${GROMACS_VERSION} needs CMake 3.18.4+." ;;
+        auto)  cmake_min="3.18.4"; cmake_msg="GROMACS auto mode needs CMake 3.18.4+ for the 2024 fallback; 2025.4 will additionally require 3.28+ if selected." ;;
       esac
     fi
     if ! version_ge "${cmake_ver}" "${cmake_min}"; then
@@ -1657,45 +2471,52 @@ On HPC, try 'module load' for the relevant compilers/cmake/git, or ask your admi
     fi
   fi
 
-  # CUDA sanity. A bootstrap dry-run intentionally has no nvcc yet.
-  if [[ "${INSTALL_CUDA}" -eq 1 && "${DRY_RUN}" -eq 1 && ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
-    info "Private CUDA ${CUDA_VERSION} is scheduled at ${CUDA_HOME}; nvcc is not expected during --dry-run."
-  elif "${CUDA_HOME}/bin/nvcc" --version >/dev/null 2>&1; then
-    ok "CUDA ${CUDA_VERSION} at ${CUDA_HOME}."
-    export CUDACXX="${CUDA_HOME}/bin/nvcc"
+  if is_cpu_only; then
+    ok "CPU-only backend: CUDA/nvcc/NVIDIA driver/architecture checks are not required."
   else
-    _pf_fail "nvcc at ${CUDA_HOME}/bin/nvcc is not runnable."
-  fi
-
-  # Hot CUDA files that previously caused failures on split Ubuntu/HPC CUDA
-  # packages. The auto-repair shim should have made these visible before we get
-  # here.
-  local hot_missing=() hf h l
-  if [[ "${INSTALL_CUDA}" -eq 1 && "${DRY_RUN}" -eq 1 && ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
-    info "CUDA headers/libraries will be validated after the requested toolkit bootstrap."
-  else
-    while IFS= read -r h; do
-      if [[ ! -e "${CUDA_HOME}/include/${h}" && ! -e "${CUDA_HOME}/targets/x86_64-linux/include/${h}" ]]; then
-        hot_missing+=("${h}")
-      fi
-    done < <(cuda_required_headers)
-    while IFS= read -r l; do
-      if [[ ! -e "${CUDA_HOME}/lib64/${l}" && ! -e "${CUDA_HOME}/targets/x86_64-linux/lib/${l}" ]]; then
-        hot_missing+=("${l}")
-      fi
-    done < <(cuda_required_libraries)
-    if [[ ${#hot_missing[@]} -gt 0 ]]; then
-      _pf_fail "Missing hot CUDA headers/libraries: ${hot_missing[*]}"
+    if [[ "${INSTALL_CUDA}" -eq 1 && "${DRY_RUN}" -eq 1 && ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+      info "Private CUDA ${CUDA_VERSION} is scheduled at ${CUDA_HOME}; nvcc is not expected during --dry-run."
+    elif "${CUDA_HOME}/bin/nvcc" --version >/dev/null 2>&1; then
+      ok "CUDA ${CUDA_VERSION} at ${CUDA_HOME}."
+      export CUDACXX="${CUDA_HOME}/bin/nvcc"
     else
-      ok "Hot CUDA headers/libraries present."
+      _pf_fail "nvcc at ${CUDA_HOME}/bin/nvcc is not runnable."
+    fi
+
+    local hot_missing=() h l
+    if [[ "${INSTALL_CUDA}" -eq 1 && "${DRY_RUN}" -eq 1 && ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+      info "CUDA headers/libraries will be validated after the requested toolkit bootstrap."
+    else
+      while IFS= read -r h; do
+        [[ -e "${CUDA_HOME}/include/${h}" || -e "${CUDA_HOME}/targets/x86_64-linux/include/${h}" ]] || hot_missing+=("${h}")
+      done < <(cuda_required_headers)
+      while IFS= read -r l; do
+        [[ -e "${CUDA_HOME}/lib64/${l}" || -e "${CUDA_HOME}/targets/x86_64-linux/lib/${l}" ]] || hot_missing+=("${l}")
+      done < <(cuda_required_libraries)
+      if [[ ${#hot_missing[@]} -gt 0 ]]; then
+        _pf_fail "Missing hot CUDA headers/libraries: ${hot_missing[*]}"
+      else
+        ok "Hot CUDA headers/libraries present."
+      fi
     fi
   fi
 
   if is_gromacs_only; then
-    ok "GROMACS-only mode: PLUMED/Python/ArrayFire development dependencies are not required."
+    if is_cpu_only; then
+      ok "CPU GROMACS-only mode: PLUMED/ArrayFire/OpenMPI/CUDA dependencies are not required."
+    else
+      ok "GROMACS-only mode: PLUMED/Python/ArrayFire development dependencies are not required."
+    fi
+  elif is_cpu_only; then
+    ok "CPU PLUMED route: OpenMPI/ArrayFire/CUDA development dependencies are not required."
+    if [[ "${PLUMED_DISABLE_PYTHON}" == "1" ]]; then
+      ok "PLUMED Python wrapper disabled; Python.h/pip/venv are not required."
+    fi
   elif [[ "${PLUMED_DISABLE_PYTHON}" == "1" ]]; then
     ok "PLUMED Python wrapper disabled; Python.h/pip/venv are not required."
-  elif command -v python3 >/dev/null 2>&1; then
+  fi
+
+  if is_full_stack && [[ "${PLUMED_DISABLE_PYTHON}" != "1" ]] && command -v python3 >/dev/null 2>&1; then
     if python3 - <<'PYEOF' >/dev/null 2>&1
 import sysconfig, pathlib
 p = pathlib.Path(sysconfig.get_paths().get('include', '')) / 'Python.h'
@@ -1708,40 +2529,88 @@ PYEOF
     fi
   fi
 
-  # Write-permission test on the install location (or nearest existing parent).
-  local probe="${INSTALL_ROOT}"
-  while [[ ! -e "${probe}" && "${probe}" != "/" ]]; do
-    probe="$(dirname "${probe}")"
-  done
-  if [[ ! -w "${probe}" ]]; then
-    _pf_fail "No write permission for ${probe} (needed to create ${INSTALL_ROOT}).
-Choose a user-owned --dir (for example under HOME or SCRATCH) or ask the HPC administrator to provide a writable project location. This installer does not require or invoke sudo."
+  local install_probe="${INSTALL_ROOT}" work_probe="${WORK_ROOT}"
+  while [[ ! -e "${install_probe}" && "${install_probe}" != "/" ]]; do install_probe="$(dirname "${install_probe}")"; done
+  if [[ ! -w "${install_probe}" ]]; then
+    _pf_fail "No write permission for ${install_probe} (needed to create ${INSTALL_ROOT}).
+Choose a user-owned --dir or ask the HPC administrator to provide a writable location. This installer does not require or invoke sudo."
   else
-    ok "Write permission for ${probe}."
+    ok "Write permission for installation parent ${install_probe}."
   fi
 
-  # Disk space (soft warning).
-  local avail_kb avail_gb
-  avail_kb="$(df -Pk "${probe}" 2>/dev/null | awk 'NR==2{print $4}')"
+  if [[ "${SPLIT_LAYOUT}" -eq 1 ]]; then
+    while [[ ! -e "${work_probe}" && "${work_probe}" != "/" ]]; do work_probe="$(dirname "${work_probe}")"; done
+    if [[ ! -w "${work_probe}" ]]; then
+      _pf_fail "No write permission for ${work_probe} (needed to create workspace ${WORK_ROOT}). Choose a writable --work-dir."
+    else
+      ok "Write permission for workspace parent ${work_probe}."
+    fi
+  else
+    work_probe="${install_probe}"
+  fi
+
+  local avail_kb avail_gb runtime_warn_gb work_warn_gb
+  runtime_warn_gb=2
+  is_full_stack && runtime_warn_gb=4
+  work_warn_gb=6
+  is_full_stack && ! is_cpu_only && work_warn_gb=20
+
+  avail_kb="$(df -Pk "${install_probe}" 2>/dev/null | awk 'NR==2{print $4}')"
   if [[ -n "${avail_kb}" ]]; then
     avail_gb=$(( avail_kb / 1024 / 1024 ))
-    if [[ "${avail_gb}" -lt 20 ]]; then
-      if is_gromacs_only; then
-        warn "Only ~${avail_gb} GB free at ${probe}; the GROMACS-only build still needs several GB for sources and compilation."
+    if [[ "${SPLIT_LAYOUT}" -eq 1 ]]; then
+      if (( avail_gb < runtime_warn_gb )); then
+        warn "Only ~${avail_gb} GB free at installation parent ${install_probe}; split layout keeps build sources elsewhere, but the selected runtime install should still have ~${runtime_warn_gb} GB headroom."
       else
-        warn "Only ~${avail_gb} GB free at ${probe}; the full build can need 15-25 GB."
+        ok "~${avail_gb} GB free at installation parent ${install_probe} (runtime-only split layout)."
+      fi
+    elif (( avail_gb < 20 )); then
+      if is_gromacs_only || is_cpu_only; then
+        warn "Only ~${avail_gb} GB free at ${install_probe}; the selected lightweight legacy-layout build still needs several GB for sources and compilation."
+      else
+        warn "Only ~${avail_gb} GB free at ${install_probe}; the full CUDA legacy-layout build can need 15-25 GB."
       fi
     else
-      ok "~${avail_gb} GB free at ${probe}."
+      ok "~${avail_gb} GB free at ${install_probe}."
+    fi
+  fi
+
+  if [[ "${SPLIT_LAYOUT}" -eq 1 ]]; then
+    avail_kb="$(df -Pk "${work_probe}" 2>/dev/null | awk 'NR==2{print $4}')"
+    if [[ -n "${avail_kb}" ]]; then
+      avail_gb=$(( avail_kb / 1024 / 1024 ))
+      if (( avail_gb < work_warn_gb )); then
+        warn "Only ~${avail_gb} GB free at workspace parent ${work_probe}; the selected build may need ~${work_warn_gb} GB or more while compiling."
+      else
+        ok "~${avail_gb} GB free at workspace parent ${work_probe} for sources/builds."
+      fi
     fi
   fi
 }
 
-###############################################################################
-# Build-time environment
-###############################################################################
+resolve_system_mpi_root() {
+  using_system_mpi || return 0
+  local mpicc_path prefix
+  if [[ -n "${MPI_PREFIX}" ]]; then
+    prefix="$(abspath "${MPI_PREFIX}")"
+  else
+    mpicc_path="$(command -v mpicc 2>/dev/null || true)"
+    [[ -n "${mpicc_path}" ]] || die "--use-system-mpi requested but mpicc is not on PATH. Load the site MPI module or pass --mpi-prefix."
+    prefix="$(cd "$(dirname "${mpicc_path}")/.." && pwd -P)"
+  fi
+  [[ -x "${prefix}/bin/mpicc" ]] || die "System MPI prefix does not provide bin/mpicc: ${prefix}"
+  [[ -x "${prefix}/bin/mpicxx" ]] || die "System MPI prefix does not provide bin/mpicxx: ${prefix}"
+  [[ -x "${prefix}/bin/mpirun" ]] || die "System MPI prefix does not provide bin/mpirun: ${prefix}"
+  MPI_PREFIX="${prefix}"
+  export MPI_ROOT="${prefix}"
+}
+
 setup_environment() {
-  export MPI_ROOT="${INSTALL_ROOT}/openmpi"
+  if using_system_mpi; then
+    resolve_system_mpi_root
+  else
+    export MPI_ROOT="${INSTALL_ROOT}/openmpi"
+  fi
   export FFTW_ROOT="${INSTALL_ROOT}/fftw"
   export BOOST_ROOT="${INSTALL_ROOT}/boost"
   export FMT_ROOT="${INSTALL_ROOT}/fmt"
@@ -1750,26 +2619,45 @@ setup_environment() {
   export GMX_ROOT="${INSTALL_ROOT}/gromacs"
 
   unset PKG_CONFIG_LIBDIR 2>/dev/null || true
-  if [[ -x "${CUDA_HOME}/bin/nvcc" ]]; then
+
+  if is_cpu_only; then
+    # Do not export CUDA toolchain variables into CPU build subprocesses.
+    CUDA_HOME=""
+    CUDA_VERSION="not-used"
+    export -n CUDA_HOME 2>/dev/null || true
+    unset CUDA_ROOT CUDACXX CUDAHOSTCXX 2>/dev/null || true
+  elif [[ -x "${CUDA_HOME}/bin/nvcc" ]]; then
     export CUDACXX="${CUDA_HOME}/bin/nvcc"
   fi
 
   if is_gromacs_only; then
-    # Prevent a previously activated PLUMED/ArrayFire/external-MPI stack from
-    # influencing the standalone thread-MPI build.
     unset PLUMED_ROOT PLUMED_INSTALL_PREFIX PLUMED_PREFIX PLUMED_KERNEL 2>/dev/null || true
-    export PATH="${GMX_ROOT}/bin:${CUDA_HOME}/bin:${PATH}"
-    export LD_LIBRARY_PATH="${GMX_ROOT}/lib:${GMX_ROOT}/lib64:${FFTW_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
-    export PKG_CONFIG_PATH="${GMX_ROOT}/lib/pkgconfig:${GMX_ROOT}/lib64/pkgconfig:${FFTW_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-    export CMAKE_PREFIX_PATH="${GMX_ROOT}:${FFTW_ROOT}:${CUDA_HOME}:${CMAKE_PREFIX_PATH:-}"
+    if is_cpu_only; then
+      export PATH="${GMX_ROOT}/bin:${PATH}"
+      export LD_LIBRARY_PATH="${GMX_ROOT}/lib:${GMX_ROOT}/lib64:${FFTW_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+      export PKG_CONFIG_PATH="${GMX_ROOT}/lib/pkgconfig:${GMX_ROOT}/lib64/pkgconfig:${FFTW_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+      export CMAKE_PREFIX_PATH="${GMX_ROOT}:${FFTW_ROOT}:${CMAKE_PREFIX_PATH:-}"
+    else
+      export PATH="${GMX_ROOT}/bin:${CUDA_HOME}/bin:${PATH}"
+      export LD_LIBRARY_PATH="${GMX_ROOT}/lib:${GMX_ROOT}/lib64:${FFTW_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+      export PKG_CONFIG_PATH="${GMX_ROOT}/lib/pkgconfig:${GMX_ROOT}/lib64/pkgconfig:${FFTW_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+      export CMAKE_PREFIX_PATH="${GMX_ROOT}:${FFTW_ROOT}:${CUDA_HOME}:${CMAKE_PREFIX_PATH:-}"
+    fi
     return 0
   fi
 
-  # Keep PLUMED_ROOT as a shell variable, not exported, during the build.
   unset PLUMED_ROOT PLUMED_INSTALL_PREFIX PLUMED_KERNEL 2>/dev/null || true
   PLUMED_ROOT="${INSTALL_ROOT}/plumed"
   PLUMED_INSTALL_PREFIX="${PLUMED_ROOT}"
   PLUMED_KERNEL="${PLUMED_ROOT}/lib/libplumedKernel.so"
+
+  if is_cpu_only; then
+    export PATH="${GMX_ROOT}/bin:${PLUMED_ROOT}/bin:${PATH}"
+    export LD_LIBRARY_PATH="${GMX_ROOT}/lib:${GMX_ROOT}/lib64:${PLUMED_ROOT}/lib:${FFTW_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+    export PKG_CONFIG_PATH="${GMX_ROOT}/lib/pkgconfig:${GMX_ROOT}/lib64/pkgconfig:${PLUMED_ROOT}/lib/pkgconfig:${FFTW_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    export CMAKE_PREFIX_PATH="${GMX_ROOT}:${PLUMED_ROOT}:${FFTW_ROOT}:${CMAKE_PREFIX_PATH:-}"
+    return 0
+  fi
 
   export PATH="${GMX_ROOT}/bin:${PLUMED_ROOT}/bin:${MPI_ROOT}/bin:${CUDA_HOME}/bin:${PATH}"
   export LD_LIBRARY_PATH="${GMX_ROOT}/lib:${GMX_ROOT}/lib64:${PLUMED_ROOT}/lib:${AF_ROOT}/lib:${AF_ROOT}/lib64:${FFTW_ROOT}/lib:${BOOST_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${SPDLOG_ROOT}/lib:${SPDLOG_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
@@ -1788,10 +2676,6 @@ setup_environment() {
   fi
 }
 
-# CMake can discover packages from the prefix that provided the cmake executable
-# (for example, Conda).  Keep the cmake binary usable, but make
-# package discovery ignore Conda prefixes so ArrayFire cannot silently link to
-# Conda libraries such as libfmt.so.11.
 cmake_ignore_prefixes() {
   local prefixes=() p conda_bin conda_root out=""
   for p in "${CONDA_PREFIX:-}" "${CONDA_PREFIX_1:-}"; do
@@ -1837,6 +2721,61 @@ assert_no_missing_libs() {
 ###############################################################################
 # Build stages
 ###############################################################################
+mpi_wrapper_matches_compiler() {
+  local wrapper="${1}" expected="${2}" expected_real command_line tok tok_real
+  expected_real="$(canonical_executable "${expected}" || true)"
+  [[ -n "${expected_real}" ]] || return 1
+  command_line="$("${wrapper}" --showme:command 2>/dev/null || true)"
+  [[ -n "${command_line}" ]] || return 1
+  for tok in ${command_line}; do
+    tok_real="$(canonical_executable "${tok}" || true)"
+    [[ -n "${tok_real}" && "${tok_real}" == "${expected_real}" ]] && return 0
+  done
+  return 1
+}
+
+validate_openmpi_compiler_provenance() {
+  # strict: used immediately after building OpenMPI; wrappers must match the
+  # selected toolchain. reuse: used by a resumed GROMACS stage. If the caller
+  # did not explicitly request CC/CXX, report and trust the already-installed
+  # wrapper toolchain instead of comparing it with an unrelated shell default.
+  local mode="${1:-reuse}" cc_cmd cxx_cmd
+  cc_cmd="$("${MPI_ROOT}/bin/mpicc" --showme:command 2>/dev/null || true)"
+  cxx_cmd="$("${MPI_ROOT}/bin/mpicxx" --showme:command 2>/dev/null || true)"
+  [[ -n "${cc_cmd}" && -n "${cxx_cmd}" ]] || die "MPI compiler wrappers do not report their underlying commands."
+  info "MPI mpicc compiler : ${cc_cmd}"
+  info "MPI mpicxx compiler: ${cxx_cmd}"
+
+  if [[ "${mode}" == "strict" || -n "${REQUESTED_CC}" ]]; then
+    mpi_wrapper_matches_compiler "${MPI_ROOT}/bin/mpicc" "${BUILD_CC}" \
+      || die "MPI mpicc does not use the selected C compiler (${BUILD_CC}). Reported command: ${cc_cmd}"
+  fi
+  if [[ "${mode}" == "strict" || -n "${REQUESTED_CXX}" ]]; then
+    mpi_wrapper_matches_compiler "${MPI_ROOT}/bin/mpicxx" "${BUILD_CXX}" \
+      || die "MPI mpicxx does not use the selected C++ compiler (${BUILD_CXX}). Reported command: ${cxx_cmd}"
+  fi
+
+  if [[ "${mode}" == "strict" || -n "${REQUESTED_CC}${REQUESTED_CXX}" ]]; then
+    ok "MPI wrapper compiler provenance matches the requested/selected toolchain."
+  else
+    ok "Reusing the selected MPI wrapper toolchain (no explicit CC/CXX override requested for this run)."
+  fi
+}
+
+validate_system_mpi_selection() {
+  using_system_mpi || return 0
+  section "External/system MPI validation"
+  resolve_system_mpi_root
+  "${MPI_ROOT}/bin/mpicc" --showme >/dev/null 2>&1 \
+    || die "Selected system MPI mpicc wrapper is not functional: ${MPI_ROOT}/bin/mpicc"
+  "${MPI_ROOT}/bin/mpicxx" --showme >/dev/null 2>&1 \
+    || die "Selected system MPI mpicxx wrapper is not functional: ${MPI_ROOT}/bin/mpicxx"
+  "${MPI_ROOT}/bin/mpirun" --version >/dev/null 2>&1 \
+    || die "Selected system MPI launcher is not functional: ${MPI_ROOT}/bin/mpirun"
+  validate_openmpi_compiler_provenance reuse
+  ok "Using external/system MPI at ${MPI_ROOT}; no private OpenMPI will be built."
+}
+
 stage_openmpi() {
   section "OpenMPI ${OPENMPI_VERSION} (CUDA-aware)"
   local series tarball
@@ -1847,11 +2786,18 @@ stage_openmpi() {
   rm -rf "openmpi-${OPENMPI_VERSION}"
   tar -xf "${tarball}"
   cd "openmpi-${OPENMPI_VERSION}"
-  ./configure --prefix="${MPI_ROOT}" --with-cuda="${CUDA_HOME}"
+  if [[ -n "${BUILD_FC}" ]]; then
+    env CC="${BUILD_CC}" CXX="${BUILD_CXX}" FC="${BUILD_FC}" \
+      ./configure --prefix="${MPI_ROOT}" --with-cuda="${CUDA_HOME}"
+  else
+    env CC="${BUILD_CC}" CXX="${BUILD_CXX}" \
+      ./configure --prefix="${MPI_ROOT}" --with-cuda="${CUDA_HOME}"
+  fi
   make -j"${NPROC}"
   make install
   "${MPI_ROOT}/bin/mpicc" --showme >/dev/null
   "${MPI_ROOT}/bin/mpicxx" --showme >/dev/null
+  validate_openmpi_compiler_provenance strict
   ok "OpenMPI installed at ${MPI_ROOT}"
   mark_stage_done openmpi
 }
@@ -1868,7 +2814,7 @@ stage_fftw() {
   rm -rf build-float build-double
 
   mkdir -p build-float && cd build-float
-  ../configure --prefix="${FFTW_ROOT}" --enable-float --enable-shared \
+  CC="${BUILD_CC}" ../configure --prefix="${FFTW_ROOT}" --enable-float --enable-shared \
     --enable-sse2 --enable-avx --enable-avx2 --enable-avx512 \
     CFLAGS="-O3 -march=${MARCH}"
   make -j"${NPROC}"
@@ -1876,7 +2822,7 @@ stage_fftw() {
   cd ..
 
   mkdir -p build-double && cd build-double
-  ../configure --prefix="${FFTW_ROOT}" --enable-shared \
+  CC="${BUILD_CC}" ../configure --prefix="${FFTW_ROOT}" --enable-shared \
     --enable-sse2 --enable-avx --enable-avx2 --enable-avx512 \
     CFLAGS="-O3 -march=${MARCH}"
   make -j"${NPROC}"
@@ -1913,13 +2859,19 @@ stage_fmt() {
   section "fmt ${FMT_VERSION}"
   cd "${SRC}"
   rm -rf "fmt-${FMT_VERSION}"
-  git clone --branch "${FMT_VERSION}" --depth 1 \
-    https://github.com/fmtlib/fmt.git "fmt-${FMT_VERSION}"
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    source_cache_extract_git fmt "fmt-${FMT_VERSION}" "${SRC}/fmt-${FMT_VERSION}"
+  else
+    git clone --branch "${FMT_VERSION}" --depth 1 \
+      https://github.com/fmtlib/fmt.git "fmt-${FMT_VERSION}"
+  fi
   cd "fmt-${FMT_VERSION}"
-  rm -rf build_cuda && mkdir -p build_cuda && cd build_cuda
+rm -rf build_cuda && mkdir -p build_cuda && cd build_cuda
   mapfile -t cmake_iso < <(cmake_common_isolation_args)
   cmake .. \
     -DCMAKE_INSTALL_PREFIX="${FMT_ROOT}" \
+    -DCMAKE_C_COMPILER="${BUILD_CC}" \
+    -DCMAKE_CXX_COMPILER="${BUILD_CXX}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DBUILD_SHARED_LIBS=ON \
@@ -1943,13 +2895,19 @@ stage_spdlog() {
   section "spdlog ${SPDLOG_VERSION}"
   cd "${SRC}"
   rm -rf "spdlog-${SPDLOG_VERSION}"
-  git clone --branch "v${SPDLOG_VERSION}" --depth 1 \
-    https://github.com/gabime/spdlog.git "spdlog-${SPDLOG_VERSION}"
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    source_cache_extract_git spdlog "spdlog-${SPDLOG_VERSION}" "${SRC}/spdlog-${SPDLOG_VERSION}"
+  else
+    git clone --branch "v${SPDLOG_VERSION}" --depth 1 \
+      https://github.com/gabime/spdlog.git "spdlog-${SPDLOG_VERSION}"
+  fi
   cd "spdlog-${SPDLOG_VERSION}"
   rm -rf build_cuda && mkdir -p build_cuda && cd build_cuda
   mapfile -t cmake_iso < <(cmake_common_isolation_args)
   cmake .. \
     -DCMAKE_INSTALL_PREFIX="${SPDLOG_ROOT}" \
+    -DCMAKE_C_COMPILER="${BUILD_CC}" \
+    -DCMAKE_CXX_COMPILER="${BUILD_CXX}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DSPDLOG_BUILD_SHARED=ON \
@@ -1967,14 +2925,76 @@ stage_spdlog() {
   mark_stage_done spdlog
 }
 
+patch_arrayfire_offline_fetchcontent() {
+  local af_deps_cmake="${1}/CMakeModules/AFconfigure_deps_vars.cmake"
+  [[ -f "${af_deps_cmake}" ]] || die "ArrayFire dependency helper missing: ${af_deps_cmake}"
+  python3 - "${af_deps_cmake}" <<'PYEOF_AF_OFFLINE'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = "AF_LOCAL_OFFLINE_SOURCE"
+if marker in text:
+    raise SystemExit(0)
+
+start_token = "macro(af_dep_check_and_populate dep_prefix)"
+start = text.find(start_token)
+if start < 0:
+    raise SystemExit("Could not find af_dep_check_and_populate()")
+end = text.find("endmacro()", start)
+if end < 0:
+    raise SystemExit("Could not find endmacro() for af_dep_check_and_populate()")
+end += len("endmacro()")
+original = text[start:end]
+first_newline = original.find("\n")
+if first_newline < 0:
+    raise SystemExit("Malformed af_dep_check_and_populate() macro")
+macro_header = original[:first_newline + 1]
+macro_body = original[first_newline + 1:]
+if not macro_body.rstrip().endswith("endmacro()"):
+    raise SystemExit("Unexpected macro structure")
+body_without_end = macro_body.rstrip()[:-len("endmacro()")].rstrip() + "\n"
+guarded = macro_header + '''\
+  set(AF_LOCAL_OFFLINE_SOURCE
+      "${ArrayFire_SOURCE_DIR}/extern/${dep_prefix}-src")
+  if(IS_DIRECTORY "${AF_LOCAL_OFFLINE_SOURCE}")
+    message(STATUS
+      "Using pre-populated offline source for ${dep_prefix}: ${AF_LOCAL_OFFLINE_SOURCE}")
+    set(${dep_prefix}_SOURCE_DIR "${AF_LOCAL_OFFLINE_SOURCE}")
+    set(${dep_prefix}_BINARY_DIR
+        "${ArrayFire_BINARY_DIR}/extern/${dep_prefix}-build")
+    set(${dep_prefix}_POPULATED TRUE)
+  else()
+''' + body_without_end + '''\
+  endif()
+  unset(AF_LOCAL_OFFLINE_SOURCE)
+endmacro()'''
+text = text[:start] + guarded + text[end:]
+path.write_text(text)
+PYEOF_AF_OFFLINE
+  grep -q 'AF_LOCAL_OFFLINE_SOURCE' "${af_deps_cmake}" \
+    || die "ArrayFire offline FetchContent patch was not applied."
+  ok "ArrayFire offline dependency population patched to reuse pre-populated extern sources."
+}
+
 stage_arrayfire() {
   section "ArrayFire ${ARRAYFIRE_VERSION} (CUDA backend, arch=${CUDA_ARCHS})"
   cd "${SRC}"
   rm -rf "arrayfire-${ARRAYFIRE_VERSION}"
-  git clone --recursive --branch "v${ARRAYFIRE_VERSION}" \
-    https://github.com/arrayfire/arrayfire.git "arrayfire-${ARRAYFIRE_VERSION}"
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    source_cache_extract_git arrayfire "arrayfire-${ARRAYFIRE_VERSION}" "${SRC}/arrayfire-${ARRAYFIRE_VERSION}"
+  else
+    git clone --recursive --branch "v${ARRAYFIRE_VERSION}" \
+      https://github.com/arrayfire/arrayfire.git "arrayfire-${ARRAYFIRE_VERSION}"
+  fi
   cd "arrayfire-${ARRAYFIRE_VERSION}"
-  git submodule update --init --recursive
+  if [[ "${OFFLINE}" -eq 0 ]]; then git submodule update --init --recursive; fi
+
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    validate_arrayfire_full_tree "${SRC}/arrayfire-${ARRAYFIRE_VERSION}"
+    patch_arrayfire_offline_fetchcontent "${SRC}/arrayfire-${ARRAYFIRE_VERSION}"
+  fi
 
   # Compatibility patch for ArrayFire 3.9.0 math.hpp across both normal
   # host compilation and NVRTC runtime JIT compilation.  Some newer host
@@ -2249,6 +3269,10 @@ PYEOF
   info "Using fmt CMake package: ${FMT_CMAKE_FILE}"
 
   local cuda_cccl_args=()
+  local offline_af_args=()
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    offline_af_args+=("-DAF_BUILD_EXAMPLES=OFF" "-DBUILD_TESTING=OFF")
+  fi
   if [[ -d "${CUDA_HOME}/include/cccl" ]]; then
     info "CUDA CCCL headers detected; adding ${CUDA_HOME}/include/cccl to ArrayFire C++/CUDA include paths."
     export CPATH="${CUDA_HOME}/include/cccl:${CPATH:-}"
@@ -2261,6 +3285,8 @@ PYEOF
   cmake .. \
     -DCMAKE_INSTALL_PREFIX="${AF_ROOT}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER="${BUILD_CC}" \
+    -DCMAKE_CXX_COMPILER="${BUILD_CXX}" \
     -DCMAKE_CXX_STANDARD=17 \
     -DCMAKE_CXX_STANDARD_REQUIRED=ON \
     -DCMAKE_CUDA_STANDARD=17 \
@@ -2286,6 +3312,7 @@ PYEOF
     -DNVPRUNE="${CUDA_HOME}/bin/nvprune" \
     -Dfmt_DIR="${FMT_CMAKE_DIR}" \
     ${SPDLOG_CMAKE_DIR:+-Dspdlog_DIR="${SPDLOG_CMAKE_DIR}"} \
+    "${offline_af_args[@]}" \
     "${cuda_cccl_args[@]}" \
     "${cmake_iso[@]}"
 
@@ -2680,7 +3707,13 @@ apply_plumed_local_patches() {
     fi
     candidate="${canonical}"
     cp -- "${candidate}" "${target}"
+    local candidate_hash target_hash
+    candidate_hash="$(sha256_file "${candidate}")"
+    target_hash="$(sha256_file "${target}")"
+    [[ -n "${candidate_hash}" && "${candidate_hash}" == "${target_hash}" ]] \
+      || die "Fresh-build SAXS.cpp hash mismatch after applying override: candidate=${candidate_hash:-missing}, target=${target_hash:-missing}"
     LAST_SAXS_CANDIDATE="${candidate}"
+    ok "Fresh-build SAXS.cpp override hash verified: ${candidate_hash}"
     info "Applied local SAXS.cpp override: ${candidate} -> ${target}"
     info "Persistent fresh-build SAXS backup: ${backup_dir}"
     return 0
@@ -2693,20 +3726,26 @@ apply_plumed_local_patches() {
   fi
 }
 
-stage_plumed() {
-  section "PLUMED (FFTW + ArrayFire CUDA + ISDB/SAXS, ref=${PLUMED_REF})"
+stage_plumed_cpu() {
+  section "PLUMED (CPU-only + FFTW, no MPI/ArrayFire/CUDA, ref=${PLUMED_REF})"
   unset PLUMED_PREFIX PLUMED_ROOT PLUMED_INSTALL_PREFIX PLUMED_KERNEL 2>/dev/null || true
   PLUMED_ROOT="${INSTALL_ROOT}/plumed"
   PLUMED_INSTALL_PREFIX="${PLUMED_ROOT}"
   PLUMED_KERNEL="${PLUMED_ROOT}/lib/libplumedKernel.so"
   mkdir -p "${PLUMED_ROOT}"
-  export PATH="${MPI_ROOT}/bin:${CUDA_HOME}/bin:${PATH}"
-  export LD_LIBRARY_PATH="${AF_ROOT}/lib:${AF_ROOT}/lib64:${FFTW_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+
+  local cc cxx
+  cc="${CC:-$(command -v gcc)}"
+  cxx="${CXX:-$(command -v g++)}"
+  [[ -x "${cc}" ]] || die "C compiler not runnable: ${cc}"
+  [[ -x "${cxx}" ]] || die "C++ compiler not runnable: ${cxx}"
+
+  export LD_LIBRARY_PATH="${FFTW_ROOT}/lib:${LD_LIBRARY_PATH:-}"
   unset PKG_CONFIG_LIBDIR 2>/dev/null || true
-  export PKG_CONFIG_PATH="${FFTW_ROOT}/lib/pkgconfig:${FMT_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  export PKG_CONFIG_PATH="${FFTW_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
   local plumed_python_config=()
   if [[ "${PLUMED_DISABLE_PYTHON}" == "1" ]]; then
-    info "Disabling PLUMED Python wrappers (--disable-python); core PLUMED/GROMACS integration does not need Python.h."
     plumed_python_config=(--disable-python)
   else
     ensure_python_build_module
@@ -2715,28 +3754,110 @@ stage_plumed() {
   local plumed_src="${SRC}/plumed2"
   cd "${SRC}"
   rm -rf "${plumed_src}"
-  git clone --recursive "${PLUMED_REPO}" "${plumed_src}"
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    source_cache_extract_git plumed "plumed2" "${plumed_src}"
+  else
+    git clone --recursive "${PLUMED_REPO}" "${plumed_src}"
+  fi
   cd "${plumed_src}"
-  if [[ "${PLUMED_REF}" != "master" ]]; then
+  if [[ "${OFFLINE}" -eq 0 && "${PLUMED_REF}" != "master" ]]; then
     git checkout "${PLUMED_REF}"
     git submodule update --init --recursive
   fi
   info "PLUMED commit: $(git rev-parse HEAD)"
   make distclean 2>/dev/null || true
-  apply_plumed_local_patches "${plumed_src}"
 
-  # PLUMED's configure check for ArrayFire is easy to miss: without an
-  # explicit LIBS value it may find arrayfire.h but fail the af_is_double link
-  # test, then silently continue without __PLUMED_HAS_ARRAYFIRE.  For SAXS this
-  # is fatal, so first prove a small program can link against the installed
-  # ArrayFire libraries and then pass exactly those libraries to configure.
+  # -------------------------------------------------------------------------
+  # BOOKMARK: CUSTOM SAXS.cpp CPU SUPPORT IS INTENTIONALLY NOT IMPLEMENTED.
+  # -------------------------------------------------------------------------
+  # Do NOT call apply_plumed_local_patches here. This lightweight CPU profile
+  # always builds the upstream PLUMED SAXS source and deliberately excludes the
+  # custom SAXS-development/update workflow until it has separate CPU validation.
+  info "CPU PLUMED profile: local/custom SAXS.cpp overrides are intentionally disabled; using upstream PLUMED sources."
+
+  local plumed_cppflags="-I${FFTW_ROOT}/include"
+  local plumed_ldflags="-L${FFTW_ROOT}/lib -Wl,-rpath,${FFTW_ROOT}/lib"
+  local configure_log="${plumed_src}/configure_plumed_cpu.log"
+
+  ./configure \
+    --prefix="${PLUMED_ROOT}" \
+    CC="${cc}" \
+    CXX="${cxx}" \
+    CFLAGS="-O3 -Wno-error" \
+    CXXFLAGS="-O3 -Wno-error" \
+    --enable-modules=all \
+    --disable-basic-warnings \
+    --enable-asmjit \
+    --enable-fftw \
+    --disable-mpi \
+    --disable-af_cuda \
+    --disable-af_cpu \
+    --disable-af_ocl \
+    "${plumed_python_config[@]}" \
+    --verbose \
+    CPPFLAGS="${plumed_cppflags}" \
+    LDFLAGS="${plumed_ldflags}" \
+    2>&1 | tee "${configure_log}"
+
+  info "Requested CPU PLUMED features after configure:"
+  grep -E "has arrayfire|has arrayfire_cuda|has fftw|has mpi|module isdb|__PLUMED_HAS_ARRAYFIRE|__PLUMED_HAS_MPI" \
+    src/config/config.txt src/config/config.h "${configure_log}" 2>/dev/null || true
+
+  if grep -R -Eq '(^|[[:space:]])#define[[:space:]]+__PLUMED_HAS_ARRAYFIRE|has arrayfire(_cuda)?[[:space:]]+(on|yes)' \
+       src/config "${configure_log}" config.log 2>/dev/null; then
+    die "CPU PLUMED unexpectedly enabled ArrayFire; refusing a non-lightweight build."
+  fi
+  if grep -R -Eq '(^|[[:space:]])#define[[:space:]]+__PLUMED_HAS_MPI|has mpi[[:space:]]+(on|yes)' \
+       src/config "${configure_log}" config.log 2>/dev/null; then
+    die "CPU PLUMED unexpectedly enabled external MPI; refusing the login-node profile."
+  fi
+  grep -Eq 'module isdb[[:space:]]+on' src/config/config.txt \
+    || die "CPU PLUMED configuration does not report the ISDB module enabled."
+
+  env -u PLUMED_ROOT -u PLUMED_INSTALL_PREFIX -u PLUMED_KERNEL -u PLUMED_PREFIX make -j"${NPROC}"
+  env -u PLUMED_ROOT -u PLUMED_INSTALL_PREFIX -u PLUMED_KERNEL -u PLUMED_PREFIX make install
+  [[ -x "${PLUMED_ROOT}/bin/plumed" ]] || die "CPU PLUMED executable not found after install."
+  [[ -f "${PLUMED_KERNEL}" ]] || die "CPU PLUMED kernel not found after install: ${PLUMED_KERNEL}"
+  ok "CPU-only PLUMED installed at ${PLUMED_ROOT}"
+  mark_stage_done plumed
+}
+
+configure_plumed_cuda_tree() {
+  # configure_plumed_cuda_tree <configured-source-dir>
+  # Shared by the normal PLUMED build and v35 workspace reconstruction. This
+  # function configures only; callers decide whether to compile/install.
+  local plumed_src="${1}"
+  [[ -d "${plumed_src}" ]] || die "PLUMED source directory not found: ${plumed_src}"
+
+  unset PLUMED_PREFIX PLUMED_ROOT PLUMED_INSTALL_PREFIX PLUMED_KERNEL 2>/dev/null || true
+  PLUMED_ROOT="${INSTALL_ROOT}/plumed"
+  PLUMED_INSTALL_PREFIX="${PLUMED_ROOT}"
+  PLUMED_KERNEL="${PLUMED_ROOT}/lib/libplumedKernel.so"
+  mkdir -p "${PLUMED_ROOT}" "${LOG_DIR}/plumed_probes"
+  export PATH="${MPI_ROOT}/bin:${CUDA_HOME}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${AF_ROOT}/lib:${AF_ROOT}/lib64:${FFTW_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+  unset PKG_CONFIG_LIBDIR 2>/dev/null || true
+  export PKG_CONFIG_PATH="${FFTW_ROOT}/lib/pkgconfig:${FMT_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+  local plumed_python_config=()
+  if [[ "${PLUMED_DISABLE_PYTHON}" == "1" ]]; then
+    info "Disabling PLUMED Python wrappers (--disable-python); core PLUMED/GROMACS integration does not need Python.h."
+    plumed_python_config=(--disable-python)
+  else
+    ensure_python_build_module
+  fi
+
+  # PLUMED's configure check for ArrayFire is easy to miss: without explicit
+  # LIBS it may find arrayfire.h but fail the af_is_double link test and then
+  # silently continue without __PLUMED_HAS_ARRAYFIRE.
   local af_libdir="${AF_ROOT}/lib"
   [[ -d "${af_libdir}" ]] || af_libdir="${AF_ROOT}/lib64"
   [[ -d "${af_libdir}" ]] || die "ArrayFire library directory not found under ${AF_ROOT}"
   [[ -f "${af_libdir}/libafcuda.so" ]] || die "ArrayFire CUDA library not found: ${af_libdir}/libafcuda.so"
 
-  local af_probe_src="${plumed_src}/arrayfire_link_probe.cpp"
-  local af_probe_bin="${plumed_src}/arrayfire_link_probe.exe"
+  local plumed_probe_dir="${LOG_DIR}/plumed_probes"
+  local af_probe_src="${plumed_probe_dir}/arrayfire_link_probe.cpp"
+  local af_probe_bin="${plumed_probe_dir}/arrayfire_link_probe.exe"
   cat > "${af_probe_src}" <<'EOF_AF_LINK_PROBE'
 #include <arrayfire.h>
 int main() {
@@ -2747,9 +3868,8 @@ EOF_AF_LINK_PROBE
 
   local plumed_cppflags="-I${AF_ROOT}/include -I${FFTW_ROOT}/include -I${CUDA_HOME}/include -I${CUDA_HOME}/targets/x86_64-linux/include"
   local plumed_ldflags="-L${af_libdir} -Wl,-rpath,${af_libdir} -L${FFTW_ROOT}/lib -Wl,-rpath,${FFTW_ROOT}/lib -L${FMT_ROOT}/lib -Wl,-rpath,${FMT_ROOT}/lib -L${FMT_ROOT}/lib64 -Wl,-rpath,${FMT_ROOT}/lib64 -L${MPI_ROOT}/lib -Wl,-rpath,${MPI_ROOT}/lib -L${CUDA_HOME}/lib64 -Wl,-rpath,${CUDA_HOME}/lib64 -L${CUDA_HOME}/targets/x86_64-linux/lib -Wl,-rpath,${CUDA_HOME}/targets/x86_64-linux/lib"
-  local arrayfire_libs=""
-  local candidate_libs
-  local af_link_log="${plumed_src}/arrayfire_link_probe.log"
+  local arrayfire_libs="" candidate_libs
+  local af_link_log="${plumed_probe_dir}/arrayfire_link_probe.log"
   : > "${af_link_log}"
   for candidate_libs in \
       "-lafcuda -laf -lstdc++" \
@@ -2777,13 +3897,14 @@ EOF_AF_LINK_PROBE
     fi
     warn "ldd on libafcuda.so:"
     ldd "${af_libdir}/libafcuda.so" || true
-    die "Cannot link a test program against ArrayFire; refusing to build PLUMED without ArrayFire support."
+    die "Cannot link a test program against ArrayFire; refusing to configure PLUMED without ArrayFire support."
   fi
   ok "PLUMED ArrayFire link probe passed with LIBS='${arrayfire_libs}'."
 
   export LIBRARY_PATH="${af_libdir}:${FFTW_ROOT}/lib:${FMT_ROOT}/lib:${FMT_ROOT}/lib64:${MPI_ROOT}/lib:${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LIBRARY_PATH:-}"
-  local plumed_configure_log="${plumed_src}/configure_plumed_arrayfire.log"
+  local plumed_configure_log="${plumed_probe_dir}/configure_plumed_arrayfire.log"
 
+  cd "${plumed_src}"
   env LIBS="${arrayfire_libs}" ./configure \
     --prefix="${PLUMED_ROOT}" \
     CC="${MPI_ROOT}/bin/mpicc" \
@@ -2816,9 +3937,42 @@ EOF_AF_LINK_PROBE
   if grep -R -Eq '(^|[[:space:]])#define[[:space:]]+__PLUMED_HAS_ARRAYFIRE_CUDA[[:space:]]+1|(^|[[:space:]])__PLUMED_HAS_ARRAYFIRE_CUDA([[:space:]=]|$)|has arrayfire_cuda([^[:alnum:]]|[[:space:]]).*yes' src/config "${plumed_configure_log}" config.log 2>/dev/null; then
     plumed_af_cuda_ok=1
   fi
-  [[ "${plumed_af_ok}" -eq 1 ]] || die "PLUMED configured without __PLUMED_HAS_ARRAYFIRE; stopping instead of installing a useless SAXS build."
-  [[ "${plumed_af_cuda_ok}" -eq 1 ]] || die "PLUMED configured without __PLUMED_HAS_ARRAYFIRE_CUDA; stopping instead of installing a useless SAXS build."
+  [[ "${plumed_af_ok}" -eq 1 ]] || die "PLUMED configured without __PLUMED_HAS_ARRAYFIRE; stopping instead of using a useless SAXS build."
+  [[ "${plumed_af_cuda_ok}" -eq 1 ]] || die "PLUMED configured without __PLUMED_HAS_ARRAYFIRE_CUDA; stopping instead of using a useless SAXS build."
   ok "PLUMED configure enabled ArrayFire and ArrayFire-CUDA."
+}
+
+stage_plumed() {
+  if is_cpu_only; then
+    stage_plumed_cpu
+    return 0
+  fi
+  section "PLUMED (FFTW + ArrayFire CUDA + ISDB/SAXS, ref=${PLUMED_REF})"
+  unset PLUMED_PREFIX PLUMED_ROOT PLUMED_INSTALL_PREFIX PLUMED_KERNEL 2>/dev/null || true
+  PLUMED_ROOT="${INSTALL_ROOT}/plumed"
+  PLUMED_INSTALL_PREFIX="${PLUMED_ROOT}"
+  PLUMED_KERNEL="${PLUMED_ROOT}/lib/libplumedKernel.so"
+  mkdir -p "${PLUMED_ROOT}" "${SRC}"
+
+  local plumed_src="${SRC}/plumed2"
+  cd "${SRC}"
+  rm -rf "${plumed_src}"
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    source_cache_extract_git plumed "plumed2" "${plumed_src}"
+  else
+    git clone --recursive "${PLUMED_REPO}" "${plumed_src}"
+  fi
+  cd "${plumed_src}"
+  if [[ "${OFFLINE}" -eq 0 && "${PLUMED_REF}" != "master" ]]; then
+    git checkout "${PLUMED_REF}"
+    git submodule update --init --recursive
+  fi
+  info "PLUMED commit: $(git rev-parse HEAD)"
+  make distclean 2>/dev/null || true
+  apply_plumed_local_patches "${plumed_src}"
+  configure_plumed_cuda_tree "${plumed_src}"
+
+  cd "${plumed_src}"
   # Do not let PLUMED runtime environment variables leak into the build-tree
   # executable used for generated files such as json/syntax.json.
   env -u PLUMED_ROOT -u PLUMED_INSTALL_PREFIX -u PLUMED_KERNEL -u PLUMED_PREFIX make -j"${NPROC}"
@@ -2888,8 +4042,11 @@ detect_gromacs_plumed_linkage() {
   local candidate output="" saw_runtime=0
   for candidate in \
     "${GMX_ROOT:-}/bin/gmx_mpi" \
+    "${GMX_ROOT:-}/bin/gmx" \
     "${GMX_ROOT:-}/lib/libgromacs_mpi.so" \
-    "${GMX_ROOT:-}/lib64/libgromacs_mpi.so"; do
+    "${GMX_ROOT:-}/lib64/libgromacs_mpi.so" \
+    "${GMX_ROOT:-}/lib/libgromacs.so" \
+    "${GMX_ROOT:-}/lib64/libgromacs.so"; do
     [[ -e "${candidate}" ]] || continue
     output="$(ldd "${candidate}" 2>/dev/null || true)"
     if grep -q 'libplumed' <<<"${output}"; then
@@ -2912,35 +4069,48 @@ installed_component_version() {
   local component="${1}" value=""
   case "${component}" in
     cuda)
-      value="$("${CUDA_HOME}/bin/nvcc" --version 2>/dev/null | grep -oE 'release [0-9]+\.[0-9]+' | head -n1 || true)"
+      if is_cpu_only; then value="not-used"; else value="$("${CUDA_HOME}/bin/nvcc" --version 2>/dev/null | grep -oE 'release [0-9]+\.[0-9]+' | head -n1 || true)"; fi
       ;;
     openmpi)
-      value="$("${MPI_ROOT}/bin/mpirun" --version 2>/dev/null | head -n1 || true)"
+      if is_cpu_only || is_gromacs_only; then value="not-built"; else value="$("${MPI_ROOT}/bin/mpirun" --version 2>/dev/null | head -n1 || true)"; fi
       ;;
     fftw)
       value="$(readlink -f "${FFTW_ROOT}/lib/libfftw3.so" 2>/dev/null | xargs -r basename || true)"
       ;;
     boost)
-      value="$(awk '/^#define BOOST_LIB_VERSION /{gsub(/\"/,"",$3); print $3; exit}' "${BOOST_ROOT}/include/boost/version.hpp" 2>/dev/null || true)"
+      if is_cpu_only || is_gromacs_only; then value="not-built"; else value="$(awk '/^#define BOOST_LIB_VERSION /{gsub(/\"/,"",$3); print $3; exit}' "${BOOST_ROOT}/include/boost/version.hpp" 2>/dev/null || true)"; fi
       ;;
     fmt)
-      value="$(awk '/^#define FMT_VERSION /{print $3; exit}' "${FMT_ROOT}/include/fmt/base.h" 2>/dev/null || true)"
+      if is_cpu_only || is_gromacs_only; then value="not-built"; else value="$(awk '/^#define FMT_VERSION /{print $3; exit}' "${FMT_ROOT}/include/fmt/base.h" 2>/dev/null || true)"; fi
       ;;
     spdlog)
-      value="$(awk '/^#define SPDLOG_VER_(MAJOR|MINOR|PATCH) /{v[++n]=$3} END{if(n==3) print v[1]"."v[2]"."v[3]}' "${SPDLOG_ROOT}/include/spdlog/version.h" 2>/dev/null || true)"
+      if is_cpu_only || is_gromacs_only; then value="not-built"; else value="$(awk '/^#define SPDLOG_VER_(MAJOR|MINOR|PATCH) /{v[++n]=$3} END{if(n==3) print v[1]"."v[2]"."v[3]}' "${SPDLOG_ROOT}/include/spdlog/version.h" 2>/dev/null || true)"; fi
       ;;
     arrayfire)
-      [[ ! -f "${AF_ROOT}/etc/arrayfire_version.txt" ]] \
-        || value="$(head -n1 "${AF_ROOT}/etc/arrayfire_version.txt" 2>/dev/null || true)"
+      if is_cpu_only || is_gromacs_only; then
+        value="not-built"
+      else
+        [[ ! -f "${AF_ROOT}/etc/arrayfire_version.txt" ]] \
+          || value="$(head -n1 "${AF_ROOT}/etc/arrayfire_version.txt" 2>/dev/null || true)"
+      fi
       ;;
     plumed)
-      value="$("${PLUMED_ROOT}/bin/plumed" --version 2>/dev/null | head -n1 || true)"
+      if ! is_full_stack || [[ -z "${PLUMED_ROOT:-}" || ! -x "${PLUMED_ROOT}/bin/plumed" ]]; then
+        value="not-built"
+      else
+        value="$("${PLUMED_ROOT}/bin/plumed" --no-mpi info --long-version 2>/dev/null | head -n1 || true)"
+      fi
       ;;
     gromacs)
-      local gmx_bin="${GMX_ROOT}/bin/gmx_mpi"
+      local gmx_bin="${GMX_ROOT}/bin/gmx_mpi" gmx_out=""
       [[ -x "${gmx_bin}" ]] || gmx_bin="${GMX_ROOT}/bin/gmx"
       if [[ -x "${gmx_bin}" ]]; then
-        value="$("${gmx_bin}" --version 2>/dev/null | awk -F: '/GROMACS version/{sub(/^[[:space:]]*/,"",$2); print $2; exit}' || true)"
+        if is_full_stack && ! is_cpu_only; then
+          gmx_out="$(mpi_run_one "${gmx_bin}" --version 2>/dev/null || true)"
+        else
+          gmx_out="$("${gmx_bin}" --version 2>/dev/null || true)"
+        fi
+        value="$(printf '%s\n' "${gmx_out}" | awk -F: '/GROMACS version/{sub(/^[[:space:]]*/,"",$2); print $2; exit}' || true)"
       fi
       ;;
   esac
@@ -2950,8 +4120,11 @@ installed_component_version() {
 write_installation_reports() {
   # write_installation_reports <last-action>
   local action="${1}" report manifest report_tmp manifest_tmp timestamp host
-  local plumed_src commit saxs_hash kernel_hash candidate_hash linkage
+  local has_plumed=0 plumed_prefix="" plumed_src="" commit saxs_hash kernel_hash candidate_hash linkage
   local cuda_v mpi_v fftw_v boost_v fmt_v spdlog_v af_v plumed_v gmx_v
+  local plumed_dirty plumed_diff_hash plumed_untracked mpi_cc_cmd mpi_cxx_cmd cc_v cxx_v
+  local plumed_config_path="" saxs_source_path="" kernel_path=""
+  local report_source_mode="online" report_source_cache="" report_mpi_provider="${MPI_PROVIDER}"
 
   report="${INSTALL_ROOT}/installation-info.txt"
   manifest="${INSTALL_ROOT}/installation-manifest.json"
@@ -2959,12 +4132,51 @@ write_installation_reports() {
   manifest_tmp="${manifest}.tmp.$$"
   timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   host="$(hostname 2>/dev/null || printf unknown)"
-  plumed_src="${SRC}/plumed2"
-  commit="$(git -C "${plumed_src}" rev-parse HEAD 2>/dev/null || true)"
-  saxs_hash="$(sha256_file "${plumed_src}/src/isdb/SAXS.cpp" 2>/dev/null || true)"
-  kernel_hash="$(sha256_file "${PLUMED_ROOT}/lib/libplumedKernel.so" 2>/dev/null || true)"
-  candidate_hash="$(sha256_file "${INSTALL_ROOT}/plumed_patch/SAXS.cpp" 2>/dev/null || true)"
-  linkage="$(detect_gromacs_plumed_linkage)"
+  if is_full_stack && [[ -n "${PLUMED_ROOT:-}" ]]; then
+    has_plumed=1
+    plumed_prefix="${PLUMED_ROOT}"
+    plumed_src="${SRC}/plumed2"
+    commit="$(git -C "${plumed_src}" rev-parse HEAD 2>/dev/null || true)"
+    saxs_hash="$(sha256_file "${plumed_src}/src/isdb/SAXS.cpp" 2>/dev/null || true)"
+    kernel_hash="$(sha256_file "${plumed_prefix}/lib/libplumedKernel.so" 2>/dev/null || true)"
+    candidate_hash="$(sha256_file "${INSTALL_ROOT}/plumed_patch/SAXS.cpp" 2>/dev/null || true)"
+    plumed_config_path="${plumed_src}/src/config/config.txt"
+    saxs_source_path="${plumed_src}/src/isdb/SAXS.cpp"
+    kernel_path="${plumed_prefix}/lib/libplumedKernel.so"
+    linkage="$(detect_gromacs_plumed_linkage)"
+
+    # Split-layout runtime reports remain useful even when the durable worktree
+    # is temporarily unavailable.  Fall back to the tiny provenance copies
+    # stored with the installed runtime instead of losing the recorded commit
+    # and SAXS identity.
+    if [[ -z "${commit}" && -s "${INSTALL_ROOT}/.installer_plumed_commit" ]]; then
+      commit="$(head -n1 "${INSTALL_ROOT}/.installer_plumed_commit" 2>/dev/null || true)"
+    fi
+    if [[ -z "${saxs_hash}" && -s "${INSTALL_ROOT}/.installer_saxs_sha256" ]]; then
+      saxs_hash="$(head -n1 "${INSTALL_ROOT}/.installer_saxs_sha256" 2>/dev/null || true)"
+    fi
+    if [[ ! -f "${plumed_config_path}" && -f "${plumed_prefix}/lib/plumed/src/config/config.txt" ]]; then
+      plumed_config_path="${plumed_prefix}/lib/plumed/src/config/config.txt"
+    fi
+    if [[ ! -f "${saxs_source_path}" && -f "${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp" ]]; then
+      saxs_source_path="${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp"
+    elif [[ ! -f "${saxs_source_path}" && -f "${INSTALL_ROOT}/plumed_patch/SAXS.cpp" ]]; then
+      saxs_source_path="${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
+    fi
+  else
+    commit=""; saxs_hash=""; kernel_hash=""; candidate_hash=""; linkage="none"
+  fi
+  if [[ -s "${INSTALL_ROOT}/.installer_source_mode" ]]; then
+    report_source_mode="$(head -n1 "${INSTALL_ROOT}/.installer_source_mode" 2>/dev/null || printf online)"
+  elif [[ "${OFFLINE}" -eq 1 ]]; then
+    report_source_mode="offline"
+  fi
+  if [[ -s "${INSTALL_ROOT}/.installer_source_cache" ]]; then
+    report_source_cache="$(head -n1 "${INSTALL_ROOT}/.installer_source_cache" 2>/dev/null || true)"
+  else
+    report_source_cache="${SOURCE_CACHE:-}"
+  fi
+  if is_cpu_only || is_gromacs_only; then report_mpi_provider="thread-mpi"; fi
   cuda_v="$(installed_component_version cuda)"
   mpi_v="$(installed_component_version openmpi)"
   fftw_v="$(installed_component_version fftw)"
@@ -2974,6 +4186,31 @@ write_installation_reports() {
   af_v="$(installed_component_version arrayfire)"
   plumed_v="$(installed_component_version plumed)"
   gmx_v="$(installed_component_version gromacs)"
+  if [[ -f "${INSTALL_ROOT}/.plumed_patch_reject_status" ]]; then
+    PLUMED_PATCH_REJECT_STATUS="$(head -n1 "${INSTALL_ROOT}/.plumed_patch_reject_status" 2>/dev/null || printf none)"
+  fi
+  if [[ -f "${INSTALL_ROOT}/.plumed_patch_reject_files" ]]; then
+    PLUMED_PATCH_REJECT_FILES="$(head -n1 "${INSTALL_ROOT}/.plumed_patch_reject_files" 2>/dev/null || true)"
+  fi
+  if [[ "${has_plumed}" -eq 1 ]]; then
+    plumed_dirty="$(git -C "${plumed_src}" status --porcelain --untracked-files=no 2>/dev/null || true)"
+    plumed_untracked="$(git -C "${plumed_src}" status --porcelain --untracked-files=normal 2>/dev/null | awk '$1=="??"{print $2}' | paste -sd ';' - || true)"
+  else
+    plumed_dirty=""; plumed_untracked=""
+  fi
+  if [[ "${has_plumed}" -eq 1 && -d "${plumed_src}/.git" ]]; then
+    plumed_diff_hash="$(git -C "${plumed_src}" diff --binary 2>/dev/null | sha256sum | awk '{print $1}' || true)"
+  else
+    plumed_diff_hash=""
+  fi
+  if is_full_stack && ! is_cpu_only; then
+    mpi_cc_cmd="$([[ -x "${MPI_ROOT}/bin/mpicc" ]] && "${MPI_ROOT}/bin/mpicc" --showme:command 2>/dev/null || true)"
+    mpi_cxx_cmd="$([[ -x "${MPI_ROOT}/bin/mpicxx" ]] && "${MPI_ROOT}/bin/mpicxx" --showme:command 2>/dev/null || true)"
+  else
+    mpi_cc_cmd=""; mpi_cxx_cmd=""
+  fi
+  cc_v="$(compiler_version_string "${BUILD_CC:-${CC:-gcc}}" 2>/dev/null || true)"
+  cxx_v="$(compiler_version_string "${BUILD_CXX:-${CXX:-g++}}" 2>/dev/null || true)"
 
   {
     echo "Installation information"
@@ -2982,75 +4219,151 @@ write_installation_reports() {
     echo "Host                : ${host}"
     echo "Installer           : ${SCRIPT_NAME} ${SCRIPT_VERSION}"
     echo "Last action         : ${action}"
+    echo "Accelerator/backend : ${ACCELERATOR}"
     echo "Install root        : ${INSTALL_ROOT}"
+    echo "Workspace layout    : $([[ "${SPLIT_LAYOUT}" -eq 1 ]] && echo split || echo legacy)"
+    echo "Work root           : ${WORK_ROOT}"
     echo "Activation          : ${INSTALL_ROOT}/activate.sh"
     echo "Build logs          : ${LOG_DIR}"
     echo
     echo "PLUMED / SAXS"
     echo "---------------"
-    echo "PLUMED prefix       : ${PLUMED_ROOT}"
-    echo "PLUMED source       : ${plumed_src}"
+    echo "PLUMED prefix       : ${plumed_prefix:-not-built}"
+    echo "PLUMED source       : ${plumed_src:-not-built}"
     echo "PLUMED version      : ${plumed_v}"
     echo "PLUMED commit       : ${commit:-unknown}"
-    echo "PLUMED config       : ${plumed_src}/src/config/config.txt"
-    echo "SAXS source         : ${plumed_src}/src/isdb/SAXS.cpp"
+    echo "PLUMED tracked dirty: $([[ -n "${plumed_dirty}" ]] && echo yes || echo no)"
+    echo "PLUMED diff SHA-256 : ${plumed_diff_hash:-missing}"
+    echo "PLUMED untracked    : ${plumed_untracked:-none}"
+    echo "PLUMED config       : ${plumed_config_path:-not-built}"
+    echo "SAXS source         : ${saxs_source_path:-not-built}"
     echo "SAXS source SHA-256 : ${saxs_hash:-missing}"
-    echo "SAXS candidate      : ${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
-    echo "Candidate SHA-256   : ${candidate_hash:-missing}"
-    echo "Installed kernel    : ${PLUMED_ROOT}/lib/libplumedKernel.so"
+    if ! is_full_stack; then
+      echo "SAXS candidate      : not-applicable (GROMACS-only route)"
+      echo "Candidate SHA-256   : not-applicable"
+    elif is_cpu_only; then
+      echo "SAXS candidate      : upstream-only CPU profile (custom SAXS disabled)"
+      echo "Candidate SHA-256   : not-applicable"
+    else
+      echo "SAXS candidate      : ${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
+      echo "Candidate SHA-256   : ${candidate_hash:-missing}"
+    fi
+    echo "Installed kernel    : ${kernel_path:-not-built}"
     echo "Kernel SHA-256      : ${kernel_hash:-missing}"
     echo "GROMACS linkage     : ${linkage}"
-    echo "Update history      : ${INSTALL_ROOT}/saxs_updates/history.jsonl"
-    echo "Update backups      : ${INSTALL_ROOT}/saxs_updates/backups"
+    echo "Patch reject status : ${PLUMED_PATCH_REJECT_STATUS}"
+    echo "Patch reject files  : ${PLUMED_PATCH_REJECT_FILES:-none}"
+    echo "Source mode         : ${report_source_mode}"
+    echo "Source cache        : ${report_source_cache:-not-used}"
+    echo "Update history      : $([[ "${has_plumed}" -eq 1 ]] && echo "${INSTALL_ROOT}/saxs_updates/history.jsonl" || echo not-applicable)"
+    echo "Update backups      : $([[ "${has_plumed}" -eq 1 ]] && echo "${INSTALL_ROOT}/saxs_updates/backups" || echo not-applicable)"
+    echo
+    echo "Toolchain"
+    echo "---------"
+    echo "C compiler          : ${BUILD_CC:-unknown} (${cc_v:-unknown})"
+    echo "C++ compiler        : ${BUILD_CXX:-unknown} (${cxx_v:-unknown})"
+    echo "CUDA host C++       : ${BUILD_CUDAHOSTCXX:-not-applicable}"
+    echo "MPI C wrapper       : ${mpi_cc_cmd:-not-built}"
+    echo "MPI C++ wrapper     : ${mpi_cxx_cmd:-not-built}"
     echo
     echo "Installed components"
     echo "--------------------"
-    echo "CUDA                : ${CUDA_HOME} (${cuda_v})"
-    echo "OpenMPI             : ${MPI_ROOT} (${mpi_v})"
+    if is_cpu_only; then
+      echo "CUDA                : not used"
+      echo "MPI                 : not built (thread-MPI route)"
+    elif is_gromacs_only; then
+      echo "CUDA                : ${CUDA_HOME} (${cuda_v})"
+      echo "MPI                 : not built (GROMACS thread-MPI)"
+    else
+      echo "CUDA                : ${CUDA_HOME} (${cuda_v})"
+      echo "MPI provider        : ${MPI_PROVIDER}"
+      echo "MPI                 : ${MPI_ROOT} (${mpi_v})"
+    fi
     echo "FFTW                : ${FFTW_ROOT} (${fftw_v})"
     echo "Boost               : ${BOOST_ROOT} (${boost_v})"
     echo "fmt                 : ${FMT_ROOT} (${fmt_v})"
     echo "spdlog              : ${SPDLOG_ROOT} (${spdlog_v})"
     echo "ArrayFire           : ${AF_ROOT} (${af_v})"
-    echo "PLUMED              : ${PLUMED_ROOT} (${plumed_v})"
+    echo "PLUMED              : ${plumed_prefix:-not-built} (${plumed_v})"
     echo "GROMACS             : ${GMX_ROOT} (${gmx_v})"
     echo
     echo "SAXS-only update command"
     echo "------------------------"
-    echo "${SCRIPT_NAME} --dir $(printf '%q' "${DIR}") --name $(printf '%q' "${NAME}") --update-saxs -j ${NPROC}"
+    if ! is_full_stack; then
+      echo "not-applicable for GROMACS-only route"
+    elif is_cpu_only; then
+      echo "unsupported for CPU profile: custom SAXS development/update remains CUDA/ArrayFire-only pending separate validation"
+    else
+      if [[ "${SPLIT_LAYOUT}" -eq 1 ]]; then
+        echo "${SCRIPT_NAME} --dir $(printf '%q' "${DIR}") --name $(printf '%q' "${NAME}") --work-dir $(printf '%q' "${WORK_DIR}") --update-saxs -j ${NPROC}"
+      else
+        echo "${SCRIPT_NAME} --dir $(printf '%q' "${DIR}") --name $(printf '%q' "${NAME}") --update-saxs -j ${NPROC}"
+      fi
+    fi
   } > "${report_tmp}" || return 1
 
   {
     printf '{\n'
-    printf '  "schema_version": 1,\n'
+    printf '  "schema_version": 3,\n'
     printf '  "updated_at_utc": %s,\n' "$(json_string "${timestamp}")"
     printf '  "host": %s,\n' "$(json_string "${host}")"
     printf '  "installer": {"name": %s, "version": %s},\n' "$(json_string "${SCRIPT_NAME}")" "$(json_string "${SCRIPT_VERSION}")"
     printf '  "last_action": %s,\n' "$(json_string "${action}")"
+    printf '  "accelerator": %s,\n' "$(json_string "${ACCELERATOR}")"
     printf '  "install_root": %s,\n' "$(json_string "${INSTALL_ROOT}")"
+    printf '  "workspace": {"layout": %s, "parent": %s, "root": %s, "sources": %s, "logs": %s, "checkpoints": %s},\n' \
+      "$(json_string "$([[ "${SPLIT_LAYOUT}" -eq 1 ]] && echo split || echo legacy)")" \
+      "$(json_string "${WORK_DIR}")" "$(json_string "${WORK_ROOT}")" "$(json_string "${SRC}")" \
+      "$(json_string "${LOG_DIR}")" "$(json_string "${CKPT_DIR}")"
     printf '  "activation_script": %s,\n' "$(json_string "${INSTALL_ROOT}/activate.sh")"
     printf '  "plumed": {\n'
-    printf '    "prefix": %s,\n' "$(json_string "${PLUMED_ROOT}")"
+    printf '    "prefix": %s,\n' "$(json_string "${plumed_prefix}")"
     printf '    "source": %s,\n' "$(json_string "${plumed_src}")"
     printf '    "version": %s,\n' "$(json_string "${plumed_v}")"
     printf '    "git_commit": %s,\n' "$(json_string "${commit}")"
-    printf '    "configuration": %s,\n' "$(json_string "${plumed_src}/src/config/config.txt")"
-    printf '    "kernel": %s,\n' "$(json_string "${PLUMED_ROOT}/lib/libplumedKernel.so")"
+    printf '    "tracked_dirty": %s,\n' "$([[ -n "${plumed_dirty}" ]] && printf true || printf false)"
+    printf '    "tracked_diff_sha256": %s,\n' "$(json_string "${plumed_diff_hash}")"
+    printf '    "untracked_files": %s,\n' "$(json_string "${plumed_untracked}")"
+    printf '    "patch_reject_status": %s,\n' "$(json_string "${PLUMED_PATCH_REJECT_STATUS}")"
+    printf '    "patch_reject_files": %s,\n' "$(json_string "${PLUMED_PATCH_REJECT_FILES}")"
+    printf '    "configuration": %s,\n' "$(json_string "${plumed_config_path}")"
+    printf '    "kernel": %s,\n' "$(json_string "${kernel_path}")"
     printf '    "kernel_sha256": %s\n' "$(json_string "${kernel_hash}")"
     printf '  },\n'
     printf '  "saxs": {\n'
-    printf '    "source": %s,\n' "$(json_string "${plumed_src}/src/isdb/SAXS.cpp")"
+    printf '    "source": %s,\n' "$(json_string "${saxs_source_path}")"
     printf '    "source_sha256": %s,\n' "$(json_string "${saxs_hash}")"
-    printf '    "canonical_candidate": %s,\n' "$(json_string "${INSTALL_ROOT}/plumed_patch/SAXS.cpp")"
-    printf '    "candidate_sha256": %s,\n' "$(json_string "${candidate_hash}")"
-    printf '    "history": %s,\n' "$(json_string "${INSTALL_ROOT}/saxs_updates/history.jsonl")"
-    printf '    "backups": %s\n' "$(json_string "${INSTALL_ROOT}/saxs_updates/backups")"
+    if ! is_full_stack; then
+      printf '    "canonical_candidate": %s,\n' "$(json_string "not-applicable-gromacs-only")"
+      printf '    "candidate_sha256": %s,\n' "$(json_string "")"
+    elif is_cpu_only; then
+      printf '    "canonical_candidate": %s,\n' "$(json_string "not-applicable-upstream-only")"
+      printf '    "candidate_sha256": %s,\n' "$(json_string "")"
+    else
+      printf '    "canonical_candidate": %s,\n' "$(json_string "${INSTALL_ROOT}/plumed_patch/SAXS.cpp")"
+      printf '    "candidate_sha256": %s,\n' "$(json_string "${candidate_hash}")"
+    fi
+    printf '    "history": %s,\n' "$(json_string "$([[ "${has_plumed}" -eq 1 ]] && echo "${INSTALL_ROOT}/saxs_updates/history.jsonl" || true)")"
+    printf '    "backups": %s\n' "$(json_string "$([[ "${has_plumed}" -eq 1 ]] && echo "${INSTALL_ROOT}/saxs_updates/backups" || true)")"
     printf '  },\n'
     printf '  "gromacs": {"prefix": %s, "version": %s, "plumed_linkage": %s},\n' \
       "$(json_string "${GMX_ROOT}")" "$(json_string "${gmx_v}")" "$(json_string "${linkage}")"
+    printf '  "source_acquisition": {"mode": %s, "cache": %s},\n' \
+      "$(json_string "${report_source_mode}")" "$(json_string "${report_source_cache}")"
+    printf '  "toolchain": {"cc": %s, "cc_version": %s, "cxx": %s, "cxx_version": %s, "cuda_host_cxx": %s, "mpi_provider": %s, "mpi_cc_command": %s, "mpi_cxx_command": %s},\n' \
+      "$(json_string "${BUILD_CC}")" "$(json_string "${cc_v}")" "$(json_string "${BUILD_CXX}")" "$(json_string "${cxx_v}")" \
+      "$(json_string "${BUILD_CUDAHOSTCXX}")" "$(json_string "${report_mpi_provider}")" "$(json_string "${mpi_cc_cmd}")" "$(json_string "${mpi_cxx_cmd}")"
     printf '  "components": {\n'
-    printf '    "cuda": {"prefix": %s, "version": %s},\n' "$(json_string "${CUDA_HOME}")" "$(json_string "${cuda_v}")"
-    printf '    "openmpi": {"prefix": %s, "version": %s},\n' "$(json_string "${MPI_ROOT}")" "$(json_string "${mpi_v}")"
+    if is_cpu_only; then
+      printf '    "cuda": {"prefix": %s, "version": %s},\n' "$(json_string "")" "$(json_string "not-used")"
+      printf '    "mpi": {"provider": %s, "prefix": %s, "version": %s},\n' "$(json_string "thread-mpi")" "$(json_string "")" "$(json_string "not-built")"
+    elif is_gromacs_only; then
+      printf '    "cuda": {"prefix": %s, "version": %s},\n' "$(json_string "${CUDA_HOME}")" "$(json_string "${cuda_v}")"
+      printf '    "mpi": {"provider": %s, "prefix": %s, "version": %s},\n' "$(json_string "thread-mpi")" "$(json_string "")" "$(json_string "not-built")"
+    else
+      printf '    "cuda": {"prefix": %s, "version": %s},\n' "$(json_string "${CUDA_HOME}")" "$(json_string "${cuda_v}")"
+      printf '    "mpi": {"provider": %s, "prefix": %s, "version": %s},\n' "$(json_string "${MPI_PROVIDER}")" "$(json_string "${MPI_ROOT}")" "$(json_string "${mpi_v}")"
+    fi
     printf '    "fftw": {"prefix": %s, "version": %s},\n' "$(json_string "${FFTW_ROOT}")" "$(json_string "${fftw_v}")"
     printf '    "boost": {"prefix": %s, "version": %s},\n' "$(json_string "${BOOST_ROOT}")" "$(json_string "${boost_v}")"
     printf '    "fmt": {"prefix": %s, "version": %s},\n' "$(json_string "${FMT_ROOT}")" "$(json_string "${fmt_v}")"
@@ -3065,9 +4378,132 @@ write_installation_reports() {
   ok "Installation reports updated: ${report}, ${manifest}"
 }
 
+persist_postbuild_provenance() {
+  # Keep the runtime installation self-describing even when sources/builds live
+  # elsewhere. The current SAXS source copy is intentionally tiny and allows a
+  # lost split workspace to be reconstructed safely from the source cache.
+  mkdir -p "${INSTALL_ROOT}"
+  printf '%s\n' "${WORK_DIR:-}" > "${INSTALL_ROOT}/.installer_work_parent"
+  printf '%s\n' "${WORK_ROOT:-${INSTALL_ROOT}}" > "${INSTALL_ROOT}/.installer_work_root"
+  printf '%s\n' "${PLUMED_REF:-}" > "${INSTALL_ROOT}/.installer_plumed_ref"
+  printf '%s\n' "${GROMACS_VERSION:-}" > "${INSTALL_ROOT}/.installer_gromacs_version"
+
+  if is_full_stack && [[ -d "${SRC}/plumed2/.git" ]]; then
+    local commit="" saxs_src="${SRC}/plumed2/src/isdb/SAXS.cpp" keep_dir
+    commit="$(git -C "${SRC}/plumed2" rev-parse HEAD 2>/dev/null || true)"
+    [[ -z "${commit}" ]] || printf '%s\n' "${commit}" > "${INSTALL_ROOT}/.installer_plumed_commit"
+    if ! is_cpu_only && [[ -f "${saxs_src}" ]]; then
+      keep_dir="${INSTALL_ROOT}/saxs_updates/current"
+      mkdir -p "${keep_dir}"
+      cp -f -- "${saxs_src}" "${keep_dir}/SAXS.cpp"
+      printf '%s\n' "$(sha256_file "${saxs_src}")" > "${INSTALL_ROOT}/.installer_saxs_sha256"
+    fi
+  fi
+}
+
+verify_cached_file_sha256() {
+  # verify_cached_file_sha256 <relative-path>
+  local rel="${1}" expected actual
+  [[ -s "${SOURCE_CACHE_SHA256}" ]] || die "Source-cache checksum manifest missing: ${SOURCE_CACHE_SHA256}"
+  expected="$(awk -v r="${rel}" '$2==r {print $1; exit}' "${SOURCE_CACHE_SHA256}" 2>/dev/null || true)"
+  [[ -n "${expected}" ]] || die "No SHA-256 record for ${rel} in ${SOURCE_CACHE_SHA256}."
+  actual="$(sha256_file "${SOURCE_CACHE}/${rel}")"
+  [[ "${actual}" == "${expected}" ]] || die "Cached file SHA-256 mismatch for ${rel}: expected ${expected}, got ${actual}."
+}
+
+ensure_saxs_update_worktree() {
+  local plumed_src="${SRC}/plumed2"
+  if [[ -d "${plumed_src}/.git" && -f "${plumed_src}/Makefile" && -f "${plumed_src}/src/config/config.txt" ]]; then
+    return 0
+  fi
+
+  [[ "${SPLIT_LAYOUT}" -eq 1 ]] \
+    || die "Configured PLUMED worktree is missing: ${plumed_src}. Legacy-layout updates require the retained configured source tree."
+  [[ "${DRY_RUN}" -eq 0 ]] \
+    || die "The recorded split workspace is missing. A real --update-saxs run can reconstruct it from the recorded source cache; dry-run will not create the workspace."
+  [[ -n "${SOURCE_CACHE}" ]] \
+    || die "Split workspace is missing and no source cache is recorded. Cannot reconstruct PLUMED safely."
+
+  SOURCE_CACHE="$(abspath "${SOURCE_CACHE}")"
+  SOURCE_CACHE_MANIFEST="${SOURCE_CACHE}/manifest.tsv"
+  SOURCE_CACHE_SHA256="${SOURCE_CACHE}/SHA256SUMS"
+  [[ -s "${SOURCE_CACHE_MANIFEST}" ]] || die "Cannot reconstruct PLUMED: cache manifest missing at ${SOURCE_CACHE_MANIFEST}."
+  [[ -s "${SOURCE_CACHE}/git/plumed2.tar.gz" ]] || die "Cannot reconstruct PLUMED: cached snapshot missing at ${SOURCE_CACHE}/git/plumed2.tar.gz."
+  verify_cached_file_sha256 "git/plumed2.tar.gz"
+
+  section "Reconstructing missing PLUMED workspace"
+  mkdir -p "${SRC}" "${LOG_DIR}"
+  source_cache_extract_git plumed "plumed2" "${plumed_src}"
+
+  local expected_commit="" actual_commit="" saved_saxs="" expected_saxs="" actual_saxs=""
+  if [[ -s "${INSTALL_ROOT}/.installer_plumed_commit" ]]; then
+    expected_commit="$(head -n1 "${INSTALL_ROOT}/.installer_plumed_commit")"
+  fi
+  actual_commit="$(git -C "${plumed_src}" rev-parse HEAD 2>/dev/null || true)"
+  [[ -n "${expected_commit}" ]] \
+    || die "Recorded PLUMED commit is missing; refusing to reconstruct a scientific update workspace ambiguously."
+  [[ "${actual_commit}" == "${expected_commit}" ]] \
+    || die "Reconstructed PLUMED commit mismatch: recorded=${expected_commit}, cache=${actual_commit}."
+
+  if [[ -s "${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp" ]]; then
+    saved_saxs="${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp"
+  elif [[ -s "${INSTALL_ROOT}/plumed_patch/SAXS.cpp" ]]; then
+    saved_saxs="${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
+  else
+    die "No preserved installed SAXS.cpp is available to reconstruct the workspace."
+  fi
+  expected_saxs="$(head -n1 "${INSTALL_ROOT}/.installer_saxs_sha256" 2>/dev/null || true)"
+  actual_saxs="$(sha256_file "${saved_saxs}")"
+  [[ -z "${expected_saxs}" || "${actual_saxs}" == "${expected_saxs}" ]] \
+    || die "Preserved SAXS source hash does not match the recorded installed state; refusing reconstruction."
+  cp -f -- "${saved_saxs}" "${plumed_src}/src/isdb/SAXS.cpp"
+
+  cd "${plumed_src}"
+  make distclean 2>/dev/null || true
+  configure_plumed_cuda_tree "${plumed_src}"
+  [[ -f "${plumed_src}/Makefile" && -f "${plumed_src}/src/config/config.txt" ]] \
+    || die "PLUMED workspace reconstruction did not produce a configured tree."
+  ok "Reconstructed configured PLUMED workspace at ${plumed_src} (commit ${actual_commit}, SAXS ${actual_saxs})."
+}
+
+validate_split_runtime_independence() {
+  [[ "${SPLIT_LAYOUT}" -eq 1 ]] || return 0
+  section "Split-layout runtime independence"
+  local x out bad=0
+  local -a targets=()
+  [[ -x "${GMX_ROOT}/bin/gmx" ]] && targets+=("${GMX_ROOT}/bin/gmx")
+  [[ -x "${GMX_ROOT}/bin/gmx_mpi" ]] && targets+=("${GMX_ROOT}/bin/gmx_mpi")
+  [[ -f "${PLUMED_KERNEL:-}" ]] && targets+=("${PLUMED_KERNEL}")
+  [[ -f "${AF_ROOT:-}/lib/libafcuda.so" ]] && targets+=("${AF_ROOT}/lib/libafcuda.so")
+  [[ -f "${AF_ROOT:-}/lib64/libafcuda.so" ]] && targets+=("${AF_ROOT}/lib64/libafcuda.so")
+
+  for x in "${targets[@]}"; do
+    out="$(ldd "${x}" 2>/dev/null || true)"
+    if grep -Fq "${WORK_ROOT}" <<<"${out}"; then
+      err "Runtime linkage still resolves through workspace ${WORK_ROOT}: ${x}"
+      bad=1
+    fi
+    if command -v readelf >/dev/null 2>&1; then
+      out="$(readelf -d "${x}" 2>/dev/null || true)"
+      if grep -Fq "${WORK_ROOT}" <<<"${out}"; then
+        err "RPATH/RUNPATH contains workspace ${WORK_ROOT}: ${x}"
+        bad=1
+      fi
+    fi
+  done
+  [[ "${bad}" -eq 0 ]] || die "Split-layout runtime independence check failed; installed runtime must not depend on the build workspace."
+  ok "Critical runtime binaries/libraries do not resolve through the build workspace."
+}
+
 setup_saxs_update_environment() {
   local activate="${INSTALL_ROOT}/activate.sh"
+  if [[ -f "${INSTALL_ROOT}/.installer_accelerator" ]] \
+     && [[ "$(head -n1 "${INSTALL_ROOT}/.installer_accelerator" 2>/dev/null || true)" == "cpu" ]]; then
+    die "This is a CPU-only installation. CPU support for the custom SAXS-development/update workflow is intentionally out of scope; use the validated CUDA/ArrayFire SAXS environment for --update-saxs."
+  fi
   [[ -f "${activate}" ]] || die "Activation script not found: ${activate}"
+  load_persisted_install_profile
+  resolve_paths
   # This is the activation file generated for the selected installation. It
   # pins the dependency paths used by that build, avoiding toolchain drift.
   # shellcheck disable=SC1090
@@ -3460,10 +4896,13 @@ run_saxs_update() {
   local plumed_src candidate canonical old_hash new_hash kernel_hash commit linkage
   local gmx_bin="" gmx_hash_before="" gmx_hash_after=""
   CURRENT_OPERATION="update-saxs"
+
+  [[ -d "${INSTALL_ROOT}" ]] || die "Existing install root not found: ${INSTALL_ROOT}"
+  load_persisted_install_profile
+  resolve_paths
   plumed_src="${SRC}/plumed2"
   SAXS_UPDATE_TARGET="${plumed_src}/src/isdb/SAXS.cpp"
 
-  [[ -d "${INSTALL_ROOT}" ]] || die "Existing install root not found: ${INSTALL_ROOT}"
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     mkdir -p "${LOG_DIR}"
     LOG_FILE="${LOG_DIR}/saxs_update_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
@@ -3475,6 +4914,9 @@ run_saxs_update() {
   fi
 
   setup_saxs_update_environment
+  ensure_saxs_update_worktree
+  plumed_src="${SRC}/plumed2"
+  SAXS_UPDATE_TARGET="${plumed_src}/src/isdb/SAXS.cpp"
   validate_saxs_update_install
   inspect_saxs_update_python "${plumed_src}"
   candidate="$(resolve_saxs_update_candidate)"
@@ -3500,6 +4942,7 @@ run_saxs_update() {
   if [[ "${old_hash}" == "${new_hash}" && "${FORCE}" -eq 0 ]]; then
     if saxs_installed_state_matches "${new_hash}" "${kernel_hash}" "${commit}"; then
       info "No SAXS source or installed-state change detected; nothing was rebuilt or installed."
+      persist_postbuild_provenance
       write_installation_reports "saxs-update-noop"
       return 0
     fi
@@ -3596,6 +5039,8 @@ run_saxs_update() {
   } >> "${SAXS_UPDATE_BACKUP_DIR}/backup-info.txt"
   write_saxs_installed_state "${SAXS_UPDATE_NEW_HASH}" "${SAXS_UPDATE_NEW_KERNEL_HASH}" "${SAXS_UPDATE_COMMIT}" \
     || warn "Could not write the successful installed-source/kernel state marker; a repeated update will rebuild safely."
+  persist_postbuild_provenance \
+    || warn "Could not refresh durable workspace/SAXS provenance after the successful update."
   # The live scientific artifacts are now validated. Metadata failures from
   # this point must not roll back a working kernel; report them as warnings.
   SAXS_UPDATE_ACTIVE=0
@@ -3637,7 +5082,7 @@ mpi_cxx_compiler_version_string() {
   # GROMACS-only uses the normal C++ compiler. The full route prefers the
   # compiler behind the locally built OpenMPI wrapper.
   local wrapper="${MPI_ROOT}/bin/mpicxx" cmd ver
-  if is_gromacs_only; then
+  if is_gromacs_only || is_cpu_only; then
     if [[ -n "${CXX:-}" ]] && command -v "${CXX}" >/dev/null 2>&1; then
       compiler_version_string "${CXX}"
     elif command -v g++ >/dev/null 2>&1; then
@@ -3674,9 +5119,8 @@ ensure_cmake_for_selected_gromacs() {
 
 resolve_gromacs_selection() {
   # Resolves GROMACS_VERSION, PLUMED_GROMACS_PATCH and source URLs.
-  # In auto mode, choose the newest GROMACS branch that the available toolchain
-  # can configure: GROMACS 2025 requires both GCC/G++ >=11 and CUDA >=12.1.
-  # On systems with CUDA 12.0, fall back to GROMACS 2024.6.
+  # CUDA mode preserves the historical selection rule. CPU-only mode needs no
+  # CUDA version and selects from the host C/C++ compiler alone.
   local ver major reason=""
   if [[ "${GROMACS_VERSION}" == "auto" ]]; then
     ver="$(mpi_cxx_compiler_version_string || true)"
@@ -3684,7 +5128,7 @@ resolve_gromacs_selection() {
 
     if [[ -n "${ver}" && "${major}" =~ ^[0-9]+$ && "${major}" -lt 11 ]]; then
       reason="GCC/G++ ${ver} is older than 11"
-    elif ! version_ge "${CUDA_VERSION}" "12.1"; then
+    elif is_cuda_backend && ! version_ge "${CUDA_VERSION}" "12.1"; then
       reason="CUDA ${CUDA_VERSION} is older than 12.1"
     fi
 
@@ -3693,7 +5137,13 @@ resolve_gromacs_selection() {
       info "${reason}; selecting GROMACS ${GROMACS_VERSION} fallback."
     else
       GROMACS_VERSION="2025.4"
-      if [[ -n "${ver}" ]]; then
+      if is_cpu_only; then
+        if [[ -n "${ver}" ]]; then
+          info "Detected GCC/G++ ${ver}; selecting CPU GROMACS ${GROMACS_VERSION}."
+        else
+          warn "Could not determine compiler version; defaulting CPU profile to GROMACS ${GROMACS_VERSION}."
+        fi
+      elif [[ -n "${ver}" ]]; then
         info "Detected GCC/G++ ${ver} and CUDA ${CUDA_VERSION}; selecting GROMACS ${GROMACS_VERSION}."
       else
         warn "Could not determine compiler version, but CUDA ${CUDA_VERSION} is >=12.1; defaulting to GROMACS ${GROMACS_VERSION}."
@@ -3701,7 +5151,7 @@ resolve_gromacs_selection() {
     fi
   fi
 
-  if [[ "${GROMACS_VERSION}" == 2025* ]] && ! version_ge "${CUDA_VERSION}" "12.1"; then
+  if [[ "${PREFETCH}" -eq 0 ]] && is_cuda_backend && [[ "${GROMACS_VERSION}" == 2025* ]] && ! version_ge "${CUDA_VERSION}" "12.1"; then
     die "GROMACS ${GROMACS_VERSION} with CUDA requires CUDA >=12.1, but CUDA ${CUDA_VERSION} was detected. Use --gromacs-version 2024.6 --gromacs-patch gromacs-2024.3, or install/load CUDA >=12.1."
   fi
 
@@ -3719,9 +5169,50 @@ resolve_gromacs_selection() {
   GROMACS_FTP_URL="${GROMACS_FTP_URL:-ftp://ftp.gromacs.org/gromacs/gromacs-${GROMACS_VERSION}.tar.gz}"
 }
 
+gromacs_cmakelists_has_expected_plumed_state() {
+  local f="${1}" manage_count manage_line applied_line link_count
+  [[ -f "${f}" ]] || return 1
+  manage_count="$(grep -Ec '^[[:space:]]*gmx_manage_plumed\(\)[[:space:]]*$' "${f}" || true)"
+  manage_line="$(grep -n -m1 -E '^[[:space:]]*gmx_manage_plumed\(\)[[:space:]]*$' "${f}" | cut -d: -f1 || true)"
+  applied_line="$(grep -n -m1 -E '^[[:space:]]*add_subdirectory\(applied_forces\)' "${f}" | cut -d: -f1 || true)"
+  link_count="$(grep -Ec '^[[:space:]]*target_link_libraries\(libgromacs[[:space:]]+PRIVATE[[:space:]]+plumedgmx\)' "${f}" || true)"
+  [[ "${manage_count}" -eq 1 && "${link_count}" -ge 1 && -n "${manage_line}" && -n "${applied_line}" && "${manage_line}" -lt "${applied_line}" ]]
+}
+
+inspect_plumed_patch_rejects() {
+  local tree="${1}" rej rel
+  local -a rejects=() unknown=()
+  mapfile -t rejects < <(find "${tree}" -type f -name '*.rej' -print 2>/dev/null | sort)
+  if [[ ${#rejects[@]} -eq 0 ]]; then
+    PLUMED_PATCH_REJECT_STATUS="none"
+    PLUMED_PATCH_REJECT_FILES=""
+    printf '%s\n' "${PLUMED_PATCH_REJECT_STATUS}" > "${INSTALL_ROOT}/.plumed_patch_reject_status"
+    : > "${INSTALL_ROOT}/.plumed_patch_reject_files"
+    return 0
+  fi
+  for rej in "${rejects[@]}"; do
+    rel="${rej#${tree}/}"
+    if [[ "${rel}" == "src/gromacs/CMakeLists.txt.rej" ]] \
+       && gromacs_cmakelists_has_expected_plumed_state "${tree}/src/gromacs/CMakeLists.txt"; then
+      ok "PLUMED patch reject '${rel}' is acceptable: the requested GROMACS CMake PLUMED state is already present."
+    else
+      unknown+=("${rel}")
+    fi
+  done
+  PLUMED_PATCH_REJECT_FILES="$(printf '%s;' "${rejects[@]#${tree}/}" | sed 's/;$//')"
+  if [[ ${#unknown[@]} -gt 0 ]]; then
+    PLUMED_PATCH_REJECT_STATUS="unresolved"
+    printf '%s\n' "${PLUMED_PATCH_REJECT_STATUS}" > "${INSTALL_ROOT}/.plumed_patch_reject_status"
+    printf '%s\n' "${PLUMED_PATCH_REJECT_FILES}" > "${INSTALL_ROOT}/.plumed_patch_reject_files"
+    die "PLUMED patch left unresolved reject file(s): ${unknown[*]}. Inspect the patch before compiling GROMACS."
+  fi
+  PLUMED_PATCH_REJECT_STATUS="accepted-already-applied"
+  printf '%s\n' "${PLUMED_PATCH_REJECT_STATUS}" > "${INSTALL_ROOT}/.plumed_patch_reject_status"
+  printf '%s\n' "${PLUMED_PATCH_REJECT_FILES}" > "${INSTALL_ROOT}/.plumed_patch_reject_files"
+}
+
 patch_gromacs_with_plumed() {
   local engine="${1}"
-
   if command -v plumed-patch >/dev/null 2>&1; then
     plumed-patch -p -e "${engine}"
   elif command -v plumed >/dev/null 2>&1; then
@@ -3729,11 +5220,83 @@ patch_gromacs_with_plumed() {
   else
     die "Neither plumed-patch nor plumed is on PATH; activate/rebuild PLUMED before the GROMACS stage."
   fi
+  inspect_plumed_patch_rejects "$(pwd -P)"
+}
+
+stage_gromacs_only_cpu() {
+  resolve_gromacs_selection
+  ensure_cmake_for_selected_gromacs
+  validate_gromacs_2025_compiler
+  section "GROMACS ${GROMACS_VERSION} (standalone CPU + thread-MPI, SIMD=${GMX_SIMD})"
+
+  local gmx_tarball="gromacs-${GROMACS_VERSION}.tar.gz"
+  local gmx_src="${SRC}/gromacs-${GROMACS_VERSION}"
+  local cc cxx
+  cc="${CC:-$(command -v gcc)}"
+  cxx="${CXX:-$(command -v g++)}"
+  [[ -x "${cc}" ]] || die "C compiler not runnable: ${cc}"
+  [[ -x "${cxx}" ]] || die "C++ compiler not runnable: ${cxx}"
+
+  unset PLUMED_ROOT PLUMED_INSTALL_PREFIX PLUMED_PREFIX PLUMED_KERNEL CUDACXX CUDAHOSTCXX CUDA_ROOT 2>/dev/null || true
+  export LD_LIBRARY_PATH="${FFTW_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+  export PKG_CONFIG_PATH="${FFTW_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  export CMAKE_PREFIX_PATH="${FFTW_ROOT}:${CMAKE_PREFIX_PATH:-}"
+
+  cd "${SRC}"
+  download_first_available "${gmx_tarball}" "${GROMACS_URL}" "${GROMACS_FTP_URL}"
+  rm -rf "${gmx_src}"
+  tar -xf "${gmx_tarball}"
+  cd "${gmx_src}"
+  rm -rf build && mkdir -p build && cd build
+
+  mapfile -t cmake_iso < <(cmake_common_isolation_args)
+  cmake .. \
+    -DCMAKE_INSTALL_PREFIX="${GMX_ROOT}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER="${cc}" \
+    -DCMAKE_CXX_COMPILER="${cxx}" \
+    -DGMX_MPI=OFF \
+    -DGMX_THREAD_MPI=ON \
+    -DGMX_OPENMP=ON \
+    -DGMX_GPU=OFF \
+    -DGMX_BUILD_OWN_FFTW=OFF \
+    -DGMX_FFT_LIBRARY=fftw3 \
+    -DFFTWF_INCLUDE_DIR="${FFTW_ROOT}/include" \
+    -DFFTWF_LIBRARY="${FFTW_ROOT}/lib/libfftw3f.so" \
+    -DGMX_SIMD="${GMX_SIMD}" \
+    -DGMXAPI=OFF \
+    -DGMX_INSTALL_LEGACY_API=ON \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGMX_INSTALL_NBLIB_API=ON \
+    -DREGRESSIONTEST_DOWNLOAD=OFF \
+    -DCMAKE_PREFIX_PATH="${FFTW_ROOT}" \
+    -DCMAKE_BUILD_RPATH="${FFTW_ROOT}/lib" \
+-DCMAKE_INSTALL_RPATH="${FFTW_ROOT}/lib" \
+    -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
+    "${cmake_iso[@]}"
+
+  grep -Eq '^GMX_MPI:BOOL=OFF$' CMakeCache.txt || die "CPU GROMACS did not retain GMX_MPI=OFF."
+  grep -Eq '^GMX_THREAD_MPI:BOOL=ON$' CMakeCache.txt || die "CPU GROMACS did not retain GMX_THREAD_MPI=ON."
+  grep -Eq '^GMX_GPU:STRING=OFF$' CMakeCache.txt || die "CPU GROMACS did not retain GMX_GPU=OFF."
+
+  make -j"${NPROC}"
+  make install
+  [[ -x "${GMX_ROOT}/bin/gmx" ]] || die "gmx not found after CPU GROMACS install."
+  if ldd "${GMX_ROOT}/bin/gmx" 2>/dev/null | grep -Eqi 'libmpi|open-pal|cuda|cudart|cufft|nvidia'; then
+    die "CPU GROMACS unexpectedly links external MPI or CUDA/NVIDIA libraries."
+  fi
+  ok "Standalone CPU/thread-MPI GROMACS installed at ${GMX_ROOT}"
+  mark_stage_done gromacs
 }
 
 stage_gromacs_only() {
+  if is_cpu_only; then
+    stage_gromacs_only_cpu
+    return 0
+  fi
   resolve_gromacs_selection
   ensure_cmake_for_selected_gromacs
+  validate_gromacs_2025_compiler
   section "GROMACS ${GROMACS_VERSION} (standalone thread-MPI + CUDA, SIMD=${GMX_SIMD})"
 
   local gmx_tarball="gromacs-${GROMACS_VERSION}.tar.gz"
@@ -3829,13 +5392,155 @@ stage_gromacs_only() {
   mark_stage_done gromacs
 }
 
+stage_gromacs_plumed_cpu() {
+  resolve_gromacs_selection
+  ensure_cmake_for_selected_gromacs
+  validate_gromacs_2025_compiler
+  section "GROMACS ${GROMACS_VERSION} (CPU + PLUMED patch + thread-MPI, SIMD=${GMX_SIMD})"
+
+  local plumed_prefix="${INSTALL_ROOT}/plumed"
+  local plumed_runtime_root="${plumed_prefix}/lib/plumed"
+  local plumed_kernel="${plumed_prefix}/lib/libplumedKernel.so"
+  local gmx_tarball="gromacs-${GROMACS_VERSION}.tar.gz"
+  local gmx_src="${SRC}/gromacs-${GROMACS_VERSION}"
+  local cc cxx
+  cc="${CC:-$(command -v gcc)}"
+  cxx="${CXX:-$(command -v g++)}"
+  [[ -x "${cc}" ]] || die "C compiler not runnable: ${cc}"
+  [[ -x "${cxx}" ]] || die "C++ compiler not runnable: ${cxx}"
+  [[ -x "${plumed_prefix}/bin/plumed" ]] || die "PLUMED executable not found at ${plumed_prefix}/bin/plumed."
+  [[ -f "${plumed_kernel}" ]] || die "PLUMED kernel not found at ${plumed_kernel}."
+
+  export PATH="${plumed_prefix}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${plumed_prefix}/lib:${FFTW_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+  export PKG_CONFIG_PATH="${plumed_prefix}/lib/pkgconfig:${FFTW_ROOT}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  export CMAKE_PREFIX_PATH="${plumed_prefix}:${FFTW_ROOT}:${CMAKE_PREFIX_PATH:-}"
+  unset CUDACXX CUDAHOSTCXX CUDA_ROOT 2>/dev/null || true
+
+  cd "${SRC}"
+  download_first_available "${gmx_tarball}" "${GROMACS_URL}" "${GROMACS_FTP_URL}"
+  rm -rf "${gmx_src}"
+  tar -xf "${gmx_tarball}"
+  cd "${gmx_src}"
+  info "Patching CPU GROMACS with PLUMED engine '${PLUMED_GROMACS_PATCH}'."
+  (
+    export PLUMED_PREFIX="${plumed_prefix}"
+    export PLUMED_ROOT="${plumed_runtime_root}"
+    export PLUMED_KERNEL="${plumed_kernel}"
+    patch_gromacs_with_plumed "${PLUMED_GROMACS_PATCH}"
+  )
+
+  rm -rf build && mkdir -p build && cd build
+  mapfile -t cmake_iso < <(cmake_common_isolation_args)
+  cmake .. \
+    -DCMAKE_INSTALL_PREFIX="${GMX_ROOT}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER="${cc}" \
+    -DCMAKE_CXX_COMPILER="${cxx}" \
+    -DGMX_MPI=OFF \
+    -DGMX_THREAD_MPI=ON \
+    -DGMX_OPENMP=ON \
+    -DGMX_GPU=OFF \
+    -DGMX_USE_PLUMED=ON \
+    -DGMX_FFT_LIBRARY=fftw3 \
+    -DFFTWF_INCLUDE_DIR="${FFTW_ROOT}/include" \
+    -DFFTWF_LIBRARY="${FFTW_ROOT}/lib/libfftw3f.so" \
+    -DGMX_SIMD="${GMX_SIMD}" \
+    -DGMXAPI=OFF \
+    -DGMX_INSTALL_LEGACY_API=ON \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGMX_INSTALL_NBLIB_API=ON \
+    -DREGRESSIONTEST_DOWNLOAD=OFF \
+    -DCMAKE_PREFIX_PATH="${plumed_prefix};${FFTW_ROOT}" \
+    -DCMAKE_BUILD_RPATH="${plumed_prefix}/lib;${FFTW_ROOT}/lib" \
+    -DCMAKE_INSTALL_RPATH="${plumed_prefix}/lib;${FFTW_ROOT}/lib" \
+    -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
+    "${cmake_iso[@]}"
+
+  grep -Eq '^GMX_MPI:BOOL=OFF$' CMakeCache.txt || die "CPU PLUMED/GROMACS did not retain GMX_MPI=OFF."
+  grep -Eq '^GMX_THREAD_MPI:BOOL=ON$' CMakeCache.txt || die "CPU PLUMED/GROMACS did not retain GMX_THREAD_MPI=ON."
+  grep -Eq '^GMX_GPU:STRING=OFF$' CMakeCache.txt || die "CPU PLUMED/GROMACS did not retain GMX_GPU=OFF."
+
+  make -j"${NPROC}"
+  make install
+  [[ -x "${GMX_ROOT}/bin/gmx" ]] || die "gmx not found after CPU PLUMED-patched GROMACS install."
+  if ldd "${GMX_ROOT}/bin/gmx" 2>/dev/null | grep -Eqi 'libmpi|open-pal|cuda|cudart|cufft|nvidia'; then
+    die "CPU PLUMED-patched GROMACS unexpectedly links external MPI or CUDA/NVIDIA libraries."
+  fi
+  if ! env PLUMED_PREFIX="${plumed_prefix}" PLUMED_ROOT="${plumed_runtime_root}" PLUMED_KERNEL="${plumed_kernel}" \
+       "${GMX_ROOT}/bin/gmx" mdrun -h 2>&1 | grep -q -- '-plumed'; then
+    die "CPU GROMACS mdrun help does not expose the PLUMED option after patching."
+  fi
+  ok "CPU/thread-MPI PLUMED-patched GROMACS installed at ${GMX_ROOT}"
+  mark_stage_done gromacs
+}
+
+mpi_include_dirs() {
+  [[ -x "${MPI_ROOT}/bin/mpicxx" ]] || return 1
+  "${MPI_ROOT}/bin/mpicxx" --showme:incdirs 2>/dev/null \
+    | tr ' ' '\n' | sed '/^$/d' | awk '!seen[$0]++'
+}
+
+compose_external_mpi_cuda_flags() {
+  local flags="" d
+  [[ -z "${CUDAFLAGS:-}" ]] || flags+="${CUDAFLAGS} "
+  [[ -z "${CMAKE_CUDA_FLAGS:-}" ]] || flags+="${CMAKE_CUDA_FLAGS} "
+  while IFS= read -r d; do
+    [[ -d "${d}" ]] || continue
+    case " ${flags} " in
+      *" -I${d} "*) ;;
+      *) flags+="-I${d} " ;;
+    esac
+  done < <(mpi_include_dirs || true)
+  if [[ -d "${CUDA_HOME}/include/cccl" ]]; then
+    case " ${flags} " in
+      *" -I${CUDA_HOME}/include/cccl "*) ;;
+      *) flags+="-I${CUDA_HOME}/include/cccl " ;;
+    esac
+  fi
+  printf '%s\n' "${flags% }"
+}
+
+cuda_mpi_header_probe() {
+  local probe_dir="${LOG_DIR}/cuda_mpi_probe" src obj log d
+  local -a inc_args=()
+  mkdir -p "${probe_dir}"
+  src="${probe_dir}/cuda_mpi_probe.cu"
+  obj="${probe_dir}/cuda_mpi_probe.o"
+  log="${probe_dir}/cuda_mpi_probe.log"
+  cat > "${src}" <<'EOF_CUDA_MPI_PROBE'
+#include <mpi.h>
+#include <cuda_runtime.h>
+__global__ void probe_kernel() {}
+int main() { return MPI_SUCCESS == 0 ? 0 : 0; }
+EOF_CUDA_MPI_PROBE
+  while IFS= read -r d; do
+    [[ -d "${d}" ]] && inc_args+=("-I${d}")
+  done < <(mpi_include_dirs || true)
+  [[ ${#inc_args[@]} -gt 0 ]] || die "Selected MPI did not report any include directories via mpicxx --showme:incdirs."
+  if ! "${CUDACXX:-${CUDA_HOME}/bin/nvcc}" -std=c++17 \
+       -ccbin "${BUILD_CUDAHOSTCXX:-${BUILD_CXX}}" \
+       "${inc_args[@]}" -c "${src}" -o "${obj}" >"${log}" 2>&1; then
+    warn "CUDA + MPI header probe failed. Compiler output:"
+    tail -n 120 "${log}" || true
+    die "CUDA compilation cannot include mpi.h from the selected MPI installation. See ${log}"
+  fi
+  ok "CUDA + MPI header probe passed."
+}
+
 stage_gromacs() {
+  if is_cpu_only && ! is_gromacs_only; then
+    stage_gromacs_plumed_cpu
+    return 0
+  fi
   if is_gromacs_only; then
     stage_gromacs_only
     return 0
   fi
   resolve_gromacs_selection
   ensure_cmake_for_selected_gromacs
+  validate_gromacs_2025_compiler
+  validate_openmpi_compiler_provenance
   section "GROMACS ${GROMACS_VERSION} (PLUMED-patched with ${PLUMED_GROMACS_PATCH}, MPI + CUDA, SIMD=${GMX_SIMD})"
   local plumed_prefix="${INSTALL_ROOT}/plumed"
   local plumed_runtime_root="${plumed_prefix}/lib/plumed"
@@ -3883,11 +5588,14 @@ stage_gromacs() {
     nvml_args+=("-DNVML_LIBRARY=${CUDA_HOME}/targets/x86_64-linux/lib/stubs/libnvidia-ml.so")
   fi
 
-  local cuda_cccl_args=()
-  if [[ -d "${CUDA_HOME}/include/cccl" ]]; then
-    info "CUDA CCCL headers detected; adding ${CUDA_HOME}/include/cccl to GROMACS CUDA include paths."
-    cuda_cccl_args+=("-DCMAKE_CUDA_FLAGS=-I${CUDA_HOME}/include/cccl ${CMAKE_CUDA_FLAGS:-}")
+  local gmx_cuda_flags
+  local cuda_flag_args=()
+  gmx_cuda_flags="$(compose_external_mpi_cuda_flags)"
+  if [[ -n "${gmx_cuda_flags}" ]]; then
+    cuda_flag_args+=("-DCMAKE_CUDA_FLAGS=${gmx_cuda_flags}")
+    info "GROMACS CUDA flags include external-MPI headers: ${gmx_cuda_flags}"
   fi
+  cuda_mpi_header_probe
 
   mapfile -t cmake_iso < <(cmake_common_isolation_args)
   cmake .. \
@@ -3918,7 +5626,7 @@ stage_gromacs() {
     -DCMAKE_INSTALL_RPATH="${plumed_prefix}/lib;${FFTW_ROOT}/lib;${MPI_ROOT}/lib;${CUDA_HOME}/lib64;${CUDA_HOME}/targets/x86_64-linux/lib" \
     -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
     "${nvml_args[@]}" \
-    "${cuda_cccl_args[@]}" \
+    "${cuda_flag_args[@]}" \
     "${cmake_iso[@]}"
 
   info "GROMACS PLUMED/CUDA/MPI cache entries:"
@@ -3948,22 +5656,74 @@ run_stage() {
   esac
 }
 
+mpi_run_one() {
+  # Run one process through the selected external MPI launcher. This avoids
+  # calling MPI-linked CLI tools bare on systems where MPI_Init requires the
+  # resource-manager/launcher context. A timeout prevents finalization hangs.
+  [[ -x "${MPI_ROOT}/bin/mpirun" ]] || return 127
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${MPI_RUNTIME_TIMEOUT}" "${MPI_ROOT}/bin/mpirun" -np 1 "$@"
+  else
+    "${MPI_ROOT}/bin/mpirun" -np 1 "$@"
+  fi
+}
+
 ###############################################################################
 # Final checks
 ###############################################################################
 final_checks() {
   section "Final PLUMED checks"
   command -v plumed >/dev/null 2>&1 || die "plumed not found on PATH after build."
-  plumed --is-installed
-  plumed --has-mpi   || warn "plumed reports no MPI."
-  plumed --has-dlopen || true
+
+  # Avoid bare MPI initialization during feature/configuration checks. Some HPC
+  # MPI stacks require launcher/resource-manager context even for simple CLI
+  # queries. Build-time capabilities are available through `plumed config`.
+  plumed --no-mpi --is-installed
+  if is_cpu_only; then
+    if plumed --no-mpi config has mpi >/dev/null 2>&1; then
+      die "CPU-only PLUMED unexpectedly reports MPI support."
+    else
+      ok "CPU-only PLUMED correctly reports no external MPI support."
+    fi
+  else
+    plumed --no-mpi config has mpi >/dev/null 2>&1 \
+      || die "PLUMED configuration does not report MPI support."
+    plumed --no-mpi config has arrayfire >/dev/null 2>&1 \
+      || die "PLUMED configuration does not report ArrayFire support."
+    plumed --no-mpi config has arrayfire_cuda >/dev/null 2>&1 \
+      || die "PLUMED configuration does not report ArrayFire-CUDA support."
+    plumed --no-mpi config module isdb >/dev/null 2>&1 \
+      || die "PLUMED configuration does not report the ISDB module."
+    ok "PLUMED configuration reports MPI, ArrayFire, ArrayFire-CUDA and ISDB."
+
+    local plumed_mpi_out=""
+    if plumed_mpi_out="$(mpi_run_one "${PLUMED_ROOT}/bin/plumed" --has-mpi 2>&1)"; then
+      [[ -z "${plumed_mpi_out}" ]] || printf '%s\n' "${plumed_mpi_out}"
+      ok "PLUMED MPI runtime check completed through mpirun -np 1."
+    else
+      [[ -z "${plumed_mpi_out}" ]] || printf '%s\n' "${plumed_mpi_out}" >&2
+      warn "PLUMED MPI runtime check did not complete within ${MPI_RUNTIME_TIMEOUT}s or launcher returned an error. Build-time MPI support is present; rerun --finalize-only in the target MPI runtime environment."
+    fi
+
+    local saxs_manual="${LOG_DIR}/plumed-manual-saxs-final.txt"
+    if plumed --no-mpi manual --action SAXS >"${saxs_manual}" 2>&1 \
+       && grep -q 'SAXS' "${saxs_manual}"; then
+      ok "Installed PLUMED recognizes the SAXS action."
+    else
+      tail -n 80 "${saxs_manual}" 2>/dev/null || true
+      die "Installed PLUMED SAXS action validation failed."
+    fi
+  fi
+  plumed --no-mpi --has-dlopen >/dev/null 2>&1 || true
 
   [[ -f "${PLUMED_KERNEL}" ]] || die "PLUMED kernel not found: ${PLUMED_KERNEL}"
   info "PLUMED kernel link check:"
   assert_no_missing_libs "${PLUMED_KERNEL}" "PLUMED kernel"
+  if is_cpu_only && ldd "${PLUMED_KERNEL}" 2>/dev/null | grep -Eqi 'libmpi|open-pal|arrayfire|afcuda|cuda|cudart|cufft|nvidia'; then
+    die "CPU-only PLUMED kernel unexpectedly links MPI/ArrayFire/CUDA/NVIDIA libraries."
+  fi
   ok "PLUMED runtime libraries resolved."
 }
-
 
 final_gromacs_checks() {
   section "Final GROMACS checks"
@@ -3972,6 +5732,60 @@ final_gromacs_checks() {
   gmx_bin="${GMX_ROOT}/bin/${gmx_name}"
   if [[ ! -x "${gmx_bin}" ]]; then
     warn "${gmx_name} not found; skipping final GROMACS checks."
+    return 0
+  fi
+
+  if is_cpu_only; then
+    local version_out
+    if is_gromacs_only; then
+      version_out="$({
+        export GROMACS_DIR="${GMX_ROOT}"
+        export GMXBIN="${GMX_ROOT}/bin"
+        export GMXLDLIB="${GMX_ROOT}/lib"
+        export GMXMAN="${GMX_ROOT}/share/man"
+        export GMXDATA="${GMX_ROOT}/share/gromacs"
+        export PATH="${GMX_ROOT}/bin:${PATH}"
+        export LD_LIBRARY_PATH="${GMX_ROOT}/lib:${GMX_ROOT}/lib64:${FFTW_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+        unset PLUMED_ROOT PLUMED_PREFIX PLUMED_KERNEL AF_ROOT MPI_ROOT CUDA_HOME CUDA_ROOT CUDACXX CUDAHOSTCXX 2>/dev/null || true
+        "${gmx_bin}" --version
+      } 2>&1)"
+    else
+      local plumed_prefix="${INSTALL_ROOT}/plumed"
+      version_out="$({
+        export GROMACS_DIR="${GMX_ROOT}"
+        export GMXBIN="${GMX_ROOT}/bin"
+        export GMXLDLIB="${GMX_ROOT}/lib"
+        export GMXMAN="${GMX_ROOT}/share/man"
+        export GMXDATA="${GMX_ROOT}/share/gromacs"
+        export PATH="${GMX_ROOT}/bin:${plumed_prefix}/bin:${PATH}"
+        export LD_LIBRARY_PATH="${GMX_ROOT}/lib:${GMX_ROOT}/lib64:${plumed_prefix}/lib:${FFTW_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+        export PLUMED_PREFIX="${plumed_prefix}"
+        export PLUMED_ROOT="${PLUMED_PREFIX}/lib/plumed"
+        export PLUMED_KERNEL="${PLUMED_PREFIX}/lib/libplumedKernel.so"
+        unset AF_ROOT MPI_ROOT CUDA_HOME CUDA_ROOT CUDACXX CUDAHOSTCXX 2>/dev/null || true
+        "${gmx_bin}" --version
+      } 2>&1)"
+    fi
+    printf '%s
+' "${version_out}" | grep -Ei "GROMACS version|MPI library|OpenMP support|GPU support|CUDA" || true
+    if ! grep -Eqi 'MPI library:[[:space:]]*thread_mpi|thread-MPI' <<<"${version_out}"; then
+      die "CPU GROMACS does not report the expected thread-MPI runtime."
+    fi
+    if ldd "${gmx_bin}" 2>/dev/null | grep -Eqi 'libmpi|open-pal|cuda|cudart|cufft|nvidia'; then
+      die "CPU gmx unexpectedly links external MPI or CUDA/NVIDIA libraries."
+    fi
+    if ! is_gromacs_only; then
+      local plumed_prefix="${INSTALL_ROOT}/plumed"
+      if ! env PLUMED_PREFIX="${plumed_prefix}" \
+               PLUMED_ROOT="${plumed_prefix}/lib/plumed" \
+               PLUMED_KERNEL="${plumed_prefix}/lib/libplumedKernel.so" \
+               "${gmx_bin}" mdrun -h 2>&1 | grep -q -- '-plumed'; then
+        die "CPU PLUMED-patched GROMACS does not expose the -plumed mdrun option."
+      fi
+      ok "CPU PLUMED-patched GROMACS runtime check completed (thread-MPI, no CUDA)."
+    else
+      ok "CPU standalone GROMACS runtime check completed (thread-MPI, no CUDA)."
+    fi
     return 0
   fi
 
@@ -3988,7 +5802,8 @@ final_gromacs_checks() {
       unset PLUMED_ROOT PLUMED_PREFIX PLUMED_KERNEL AF_ROOT MPI_ROOT 2>/dev/null || true
       "${gmx_bin}" --version
     } 2>&1)"
-    printf '%s\n' "${version_out}" | grep -Ei "GROMACS version|MPI library|OpenMP support|GPU support|CUDA" || true
+    printf '%s
+' "${version_out}" | grep -Ei "GROMACS version|MPI library|OpenMP support|GPU support|CUDA" || true
     if ! grep -Eqi 'MPI library:[[:space:]]*thread_mpi|thread-MPI' <<<"${version_out}"; then
       die "Standalone GROMACS does not report the expected thread-MPI runtime."
     fi
@@ -3999,8 +5814,8 @@ final_gromacs_checks() {
     return 0
   fi
 
-  local plumed_prefix="${INSTALL_ROOT}/plumed"
-  (
+  local plumed_prefix="${INSTALL_ROOT}/plumed" version_out="" help_out="${LOG_DIR}/gmx-mdrun-help-final.txt"
+  if version_out="$({
     export GROMACS_DIR="${GMX_ROOT}"
     export GMXBIN="${GMX_ROOT}/bin"
     export GMXLDLIB="${GMX_ROOT}/lib"
@@ -4012,26 +5827,75 @@ final_gromacs_checks() {
     export PLUMED_ROOT="${PLUMED_PREFIX}/lib/plumed"
     export PLUMED_KERNEL="${PLUMED_PREFIX}/lib/libplumedKernel.so"
     export AF_DISABLE_GRAPHICS="${AF_DISABLE_GRAPHICS:-1}"
-    gmx_mpi --version | grep -Ei "GROMACS version|MPI|GPU|CUDA|PLUMED" || true
-  )
-  ok "GROMACS runtime check completed. Use: gmx_mpi mdrun -plumed plumed.dat"
+    mpi_run_one "${gmx_bin}" --version
+  } 2>&1)"; then
+    printf '%s\n' "${version_out}" | grep -Ei "GROMACS version|MPI|GPU|CUDA|PLUMED" || true
+    ok "GROMACS MPI runtime/version check completed through mpirun -np 1."
+  else
+    printf '%s\n' "${version_out}" >&2
+    warn "GROMACS MPI runtime/version check did not complete within ${MPI_RUNTIME_TIMEOUT}s or launcher returned an error. The installed files are retained; rerun --finalize-only in the target MPI runtime environment."
+  fi
+
+  if mpi_run_one "${gmx_bin}" mdrun -h >"${help_out}" 2>&1; then
+    if grep -q -- '-plumed' "${help_out}"; then
+      ok "GROMACS mdrun exposes the PLUMED option through the MPI launcher."
+    else
+      tail -n 80 "${help_out}" 2>/dev/null || true
+      die "GROMACS mdrun help completed but did not expose -plumed; the PLUMED patch is not usable."
+    fi
+  else
+    warn "MPI-launched GROMACS mdrun help check did not complete; inspect ${help_out} and rerun --finalize-only when the site MPI runtime is available."
+  fi
+  ok "GROMACS installation checks completed. Use: gmx_mpi mdrun -plumed plumed.dat"
 }
 
 postflight_stack_checks() {
   section "Post-flight stack sanity checks"
   local failures=0
-  _pf_ok_file() {
-    if [[ -e "$1" ]]; then ok "$2"; else warn "$2 missing: $1"; failures=$((failures + 1)); fi
-  }
-  _pf_ok_exe() {
-    if [[ -x "$1" ]]; then ok "$2"; else warn "$2 missing/not executable: $1"; failures=$((failures + 1)); fi
-  }
+  _pf_ok_file() { if [[ -e "$1" ]]; then ok "$2"; else warn "$2 missing: $1"; failures=$((failures + 1)); fi; }
+  _pf_ok_exe()  { if [[ -x "$1" ]]; then ok "$2"; else warn "$2 missing/not executable: $1"; failures=$((failures + 1)); fi; }
 
   if stage_done fftw || [[ -e "${FFTW_ROOT}/lib/libfftw3f.so" ]]; then
     _pf_ok_file "${FFTW_ROOT}/lib/libfftw3f.so" "FFTW single-precision library"
   fi
 
-  if is_gromacs_only; then
+  if is_cpu_only; then
+    local gmx_bin="${GMX_ROOT}/bin/gmx"
+    if is_full_stack; then
+      _pf_ok_exe "${PLUMED_ROOT}/bin/plumed" "CPU PLUMED executable"
+      _pf_ok_file "${PLUMED_ROOT}/lib/libplumedKernel.so" "CPU PLUMED kernel"
+      if [[ -f "${PLUMED_ROOT}/lib/libplumedKernel.so" ]] \
+         && ldd "${PLUMED_ROOT}/lib/libplumedKernel.so" 2>/dev/null | grep -Eqi 'libmpi|open-pal|arrayfire|afcuda|cuda|cudart|cufft|nvidia'; then
+        warn "CPU PLUMED kernel unexpectedly links GPU/MPI libraries"; failures=$((failures + 1))
+      else
+        ok "CPU PLUMED kernel has no external MPI/CUDA/ArrayFire linkage"
+      fi
+    fi
+    _pf_ok_exe "${gmx_bin}" "CPU GROMACS thread-MPI executable"
+    if [[ -x "${gmx_bin}" ]]; then
+      assert_no_missing_libs "${gmx_bin}" "GROMACS executable"
+      if ldd "${gmx_bin}" 2>/dev/null | grep -Eqi 'libmpi|open-pal|cuda|cudart|cufft|nvidia'; then
+        warn "CPU gmx unexpectedly links external MPI/CUDA libraries"; failures=$((failures + 1))
+      else
+        ok "CPU gmx has no external MPI/CUDA linkage"
+      fi
+      local version_out
+      version_out="$("${gmx_bin}" --version 2>&1 || true)"
+      if grep -Eqi 'MPI library:[[:space:]]*thread_mpi|thread-MPI' <<<"${version_out}"; then
+        ok "CPU GROMACS reports thread-MPI"
+      else
+        warn "CPU GROMACS version output did not confirm thread-MPI"; failures=$((failures + 1))
+      fi
+      if is_full_stack; then
+        if env PLUMED_PREFIX="${PLUMED_ROOT}" PLUMED_ROOT="${PLUMED_ROOT}/lib/plumed" PLUMED_KERNEL="${PLUMED_ROOT}/lib/libplumedKernel.so" \
+             "${gmx_bin}" mdrun -h 2>&1 | grep -q -- '-plumed'; then
+          ok "CPU GROMACS exposes the PLUMED mdrun option"
+        else
+          warn "CPU GROMACS does not expose the PLUMED mdrun option"; failures=$((failures + 1))
+        fi
+      fi
+    fi
+  elif is_gromacs_only; then
     local gmx_bin="${GMX_ROOT}/bin/gmx"
     _pf_ok_exe "${gmx_bin}" "GROMACS thread-MPI executable"
     if [[ -x "${gmx_bin}" ]]; then
@@ -4048,10 +5912,11 @@ postflight_stack_checks() {
       else
         warn "GROMACS version output did not confirm thread-MPI"; failures=$((failures + 1))
       fi
-      printf '%s\n' "${version_out}" | grep -Ei 'GROMACS version|MPI library|OpenMP support|GPU support|CUDA' || true
+      printf '%s
+' "${version_out}" | grep -Ei 'GROMACS version|MPI library|OpenMP support|GPU support|CUDA' || true
     fi
   else
-    if stage_done openmpi || [[ -x "${MPI_ROOT}/bin/mpicc" ]]; then _pf_ok_exe "${MPI_ROOT}/bin/mpicc" "OpenMPI mpicc"; fi
+    if stage_done openmpi || [[ -x "${MPI_ROOT}/bin/mpicc" ]]; then _pf_ok_exe "${MPI_ROOT}/bin/mpicc" "MPI mpicc"; fi
     local af_pf_lib=""
     if [[ -e "${AF_ROOT}/lib/libafcuda.so" ]]; then
       af_pf_lib="${AF_ROOT}/lib/libafcuda.so"
@@ -4061,11 +5926,7 @@ postflight_stack_checks() {
       af_pf_lib="$(find "${AF_ROOT}" -maxdepth 3 -name 'libafcuda.so*' -print 2>/dev/null | sort | head -n1 || true)"
     fi
     if stage_done arrayfire || [[ -n "${af_pf_lib}" ]]; then
-      if [[ -n "${af_pf_lib}" ]]; then
-        _pf_ok_file "${af_pf_lib}" "ArrayFire CUDA library"
-      else
-        warn "ArrayFire CUDA library missing under ${AF_ROOT}/lib or ${AF_ROOT}/lib64"; failures=$((failures + 1))
-      fi
+      if [[ -n "${af_pf_lib}" ]]; then _pf_ok_file "${af_pf_lib}" "ArrayFire CUDA library"; else warn "ArrayFire CUDA library missing under ${AF_ROOT}/lib or ${AF_ROOT}/lib64"; failures=$((failures + 1)); fi
     fi
     if stage_done plumed || [[ -x "${PLUMED_ROOT}/bin/plumed" ]]; then
       _pf_ok_exe "${PLUMED_ROOT}/bin/plumed" "PLUMED executable"
@@ -4085,24 +5946,83 @@ postflight_stack_checks() {
     fi
   fi
 
-  if [[ "${failures}" -gt 0 ]]; then
-    warn "Post-flight found ${failures} missing or inconsistent expected item(s)."
-  else
-    ok "Post-flight checks completed."
-  fi
+  if [[ "${failures}" -gt 0 ]]; then warn "Post-flight found ${failures} missing or inconsistent expected item(s)."; else ok "Post-flight checks completed."; fi
 }
 
-###############################################################################
-# Activation script + shell rc integration (requirement #4)
-###############################################################################
 generate_activate_script() {
   local out="${INSTALL_ROOT}/activate.sh"
   local cmake_activation_block=""
-  if [[ -n "${CMAKE_ROOT:-}" && -x "${CMAKE_ROOT}/bin/cmake" ]]; then
+  # CMake is a build-time tool.  In split-workspace mode it normally lives in
+  # durable work storage (for example $HOME), so runtime activation must not
+  # depend on it.  Preserve the legacy activation behavior when no --work-dir
+  # is used.
+  if [[ "${SPLIT_LAYOUT}" -eq 0 && -n "${CMAKE_ROOT:-}" && -x "${CMAKE_ROOT}/bin/cmake" ]]; then
     cmake_activation_block="export CMAKE_ROOT=\"${CMAKE_ROOT}\"
 export PATH=\"\${CMAKE_ROOT}/bin:\${PATH}\""
   fi
-  if is_gromacs_only; then
+
+  if is_cpu_only; then
+    if is_gromacs_only; then
+      cat > "${out}" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date).
+# CPU-only standalone GROMACS with built-in thread-MPI: source "${out}"
+
+${cmake_activation_block}
+export FFTW_ROOT="${FFTW_ROOT}"
+export GMX_ROOT="${GMX_ROOT}"
+
+# Clear GPU/full-stack variables inherited from another activated environment.
+unset CUDA_HOME CUDA_ROOT CUDACXX CUDAHOSTCXX PLUMED_PREFIX PLUMED_ROOT PLUMED_KERNEL AF_ROOT MPI_ROOT BOOST_ROOT FMT_ROOT SPDLOG_ROOT 2>/dev/null || true
+
+export GROMACS_DIR="\${GMX_ROOT}"
+export GMXBIN="\${GMX_ROOT}/bin"
+export GMXLDLIB="\${GMX_ROOT}/lib"
+export GMXMAN="\${GMX_ROOT}/share/man"
+export GMXDATA="\${GMX_ROOT}/share/gromacs"
+export PATH="\${GMX_ROOT}/bin:\${PATH}"
+export LD_LIBRARY_PATH="\${GMX_ROOT}/lib:\${GMX_ROOT}/lib64:\${FFTW_ROOT}/lib:\${LD_LIBRARY_PATH:-}"
+export PKG_CONFIG_PATH="\${GMX_ROOT}/lib/pkgconfig:\${GMX_ROOT}/lib64/pkgconfig:\${FFTW_ROOT}/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
+export CMAKE_PREFIX_PATH="\${GMX_ROOT}:\${FFTW_ROOT}:\${CMAKE_PREFIX_PATH:-}"
+
+unset GMX_GPU_DD_COMMS GMX_GPU_PME_PP_COMMS GMX_FORCE_UPDATE_DEFAULT_GPU GMX_ENABLE_DIRECT_GPU_COMM GMX_DISABLE_DIRECT_GPU_COMM 2>/dev/null || true
+
+echo "Activated '${NAME}': CPU-only standalone thread-MPI GROMACS, GMX_ROOT=\${GMX_ROOT}"
+echo "Use 'gmx' (not gmx_mpi). This build has no GPU/CUDA support."
+EOF
+    else
+      cat > "${out}" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date).
+# CPU-only PLUMED + patched GROMACS with built-in thread-MPI: source "${out}"
+
+${cmake_activation_block}
+export FFTW_ROOT="${FFTW_ROOT}"
+export GMX_ROOT="${GMX_ROOT}"
+export PLUMED_PREFIX="${PLUMED_ROOT}"
+export PLUMED_ROOT="\${PLUMED_PREFIX}/lib/plumed"
+export PLUMED_KERNEL="\${PLUMED_PREFIX}/lib/libplumedKernel.so"
+
+# Clear GPU/external-MPI variables inherited from another activated environment.
+unset CUDA_HOME CUDA_ROOT CUDACXX CUDAHOSTCXX AF_ROOT MPI_ROOT BOOST_ROOT FMT_ROOT SPDLOG_ROOT 2>/dev/null || true
+
+export GROMACS_DIR="\${GMX_ROOT}"
+export GMXBIN="\${GMX_ROOT}/bin"
+export GMXLDLIB="\${GMX_ROOT}/lib"
+export GMXMAN="\${GMX_ROOT}/share/man"
+export GMXDATA="\${GMX_ROOT}/share/gromacs"
+export PATH="\${GMX_ROOT}/bin:\${PLUMED_PREFIX}/bin:\${PATH}"
+export LD_LIBRARY_PATH="\${GMX_ROOT}/lib:\${GMX_ROOT}/lib64:\${PLUMED_PREFIX}/lib:\${FFTW_ROOT}/lib:\${LD_LIBRARY_PATH:-}"
+export PKG_CONFIG_PATH="\${GMX_ROOT}/lib/pkgconfig:\${GMX_ROOT}/lib64/pkgconfig:\${PLUMED_PREFIX}/lib/pkgconfig:\${FFTW_ROOT}/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
+export CMAKE_PREFIX_PATH="\${GMX_ROOT}:\${PLUMED_PREFIX}:\${FFTW_ROOT}:\${CMAKE_PREFIX_PATH:-}"
+
+unset GMX_GPU_DD_COMMS GMX_GPU_PME_PP_COMMS GMX_FORCE_UPDATE_DEFAULT_GPU GMX_ENABLE_DIRECT_GPU_COMM GMX_DISABLE_DIRECT_GPU_COMM 2>/dev/null || true
+
+echo "Activated '${NAME}': CPU-only PLUMED + thread-MPI GROMACS, GMX_ROOT=\${GMX_ROOT}, PLUMED_PREFIX=\${PLUMED_PREFIX}"
+echo "Use 'gmx'. Custom SAXS update support remains intentionally outside this CPU profile."
+EOF
+    fi
+  elif is_gromacs_only; then
     local direct_gpu_block
     case "${GROMACS_VERSION}" in
       2024*)
@@ -4124,27 +6044,17 @@ export CUDACXX="\${CUDA_HOME}/bin/nvcc"
 ${cmake_activation_block}
 export FFTW_ROOT="${FFTW_ROOT}"
 export GMX_ROOT="${GMX_ROOT}"
-
-# Do not inherit a previously activated PLUMED/ArrayFire/external-MPI stack.
 unset PLUMED_PREFIX PLUMED_ROOT PLUMED_KERNEL AF_ROOT MPI_ROOT BOOST_ROOT FMT_ROOT SPDLOG_ROOT 2>/dev/null || true
-
 export GROMACS_DIR="\${GMX_ROOT}"
 export GMXBIN="\${GMX_ROOT}/bin"
 export GMXLDLIB="\${GMX_ROOT}/lib"
 export GMXMAN="\${GMX_ROOT}/share/man"
 export GMXDATA="\${GMX_ROOT}/share/gromacs"
-
 export PATH="\${GMX_ROOT}/bin:\${CUDA_HOME}/bin:\${PATH}"
 export LD_LIBRARY_PATH="\${GMX_ROOT}/lib:\${GMX_ROOT}/lib64:\${FFTW_ROOT}/lib:\${CUDA_HOME}/lib64:\${CUDA_HOME}/targets/x86_64-linux/lib:\${LD_LIBRARY_PATH:-}"
 export PKG_CONFIG_PATH="\${GMX_ROOT}/lib/pkgconfig:\${GMX_ROOT}/lib64/pkgconfig:\${FFTW_ROOT}/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
 export CMAKE_PREFIX_PATH="\${GMX_ROOT}:\${FFTW_ROOT}:\${CUDA_HOME}:\${CMAKE_PREFIX_PATH:-}"
-
-# GROMACS 2024 uses GMX_ENABLE_DIRECT_GPU_COMM. In GROMACS 2025 direct GPU
-# communication is enabled by default on supported setups. The older
-# GMX_GPU_DD_COMMS and GMX_GPU_PME_PP_COMMS controls were removed, and
-# GMX_FORCE_UPDATE_DEFAULT_GPU is not a supported current variable.
 ${direct_gpu_block}
-
 echo "Activated '${NAME}': standalone thread-MPI GROMACS, GMX_ROOT=\${GMX_ROOT}, CUDA=\${CUDA_HOME}"
 echo "Use 'gmx' (not gmx_mpi). GPU update is automatic when supported; use '-update gpu' to force it for a compatible run."
 EOF
@@ -4158,6 +6068,7 @@ export CUDA_HOME="${CUDA_HOME}"
 export CUDA_ROOT="\${CUDA_HOME}"
 export CUDACXX="\${CUDA_HOME}/bin/nvcc"
 ${cmake_activation_block}
+export MPI_PROVIDER="${MPI_PROVIDER}"
 export MPI_ROOT="${MPI_ROOT}"
 export FFTW_ROOT="${FFTW_ROOT}"
 export BOOST_ROOT="${BOOST_ROOT}"
@@ -4165,40 +6076,44 @@ export FMT_ROOT="${FMT_ROOT}"
 export SPDLOG_ROOT="${SPDLOG_ROOT}"
 export AF_ROOT="${AF_ROOT}"
 export GMX_ROOT="${GMX_ROOT}"
-
 export PLUMED_PREFIX="${PLUMED_ROOT}"
 export PLUMED_ROOT="\${PLUMED_PREFIX}/lib/plumed"
 export PLUMED_KERNEL="\${PLUMED_PREFIX}/lib/libplumedKernel.so"
 export AF_DISABLE_GRAPHICS="\${AF_DISABLE_GRAPHICS:-1}"
-
 export GROMACS_DIR="\${GMX_ROOT}"
 export GMXBIN="\${GMX_ROOT}/bin"
 export GMXLDLIB="\${GMX_ROOT}/lib"
 export GMXMAN="\${GMX_ROOT}/share/man"
 export GMXDATA="\${GMX_ROOT}/share/gromacs"
-
 export PATH="\${GMX_ROOT}/bin:\${PLUMED_PREFIX}/bin:\${MPI_ROOT}/bin:\${CUDA_HOME}/bin:\${PATH}"
 export LD_LIBRARY_PATH="\${GMX_ROOT}/lib:\${GMX_ROOT}/lib64:\${PLUMED_PREFIX}/lib:\${AF_ROOT}/lib:\${AF_ROOT}/lib64:\${FFTW_ROOT}/lib:\${BOOST_ROOT}/lib:\${FMT_ROOT}/lib:\${FMT_ROOT}/lib64:\${SPDLOG_ROOT}/lib:\${SPDLOG_ROOT}/lib64:\${MPI_ROOT}/lib:\${CUDA_HOME}/lib64:\${CUDA_HOME}/targets/x86_64-linux/lib:\${LD_LIBRARY_PATH:-}"
 export PKG_CONFIG_PATH="\${GMX_ROOT}/lib/pkgconfig:\${GMX_ROOT}/lib64/pkgconfig:\${PLUMED_PREFIX}/lib/pkgconfig:\${FFTW_ROOT}/lib/pkgconfig:\${FMT_ROOT}/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
 export CMAKE_PREFIX_PATH="\${GMX_ROOT}:\${PLUMED_PREFIX}:\${AF_ROOT}:\${FFTW_ROOT}:\${BOOST_ROOT}:\${FMT_ROOT}:\${SPDLOG_ROOT}:\${MPI_ROOT}:\${CUDA_HOME}:\${CMAKE_PREFIX_PATH:-}"
-
-echo "Activated '${NAME}': GMX_ROOT=\${GMX_ROOT}, PLUMED_PREFIX=\${PLUMED_PREFIX}, CUDA=\${CUDA_HOME}"
+echo "Activated '${NAME}': GMX_ROOT=\${GMX_ROOT}, PLUMED_PREFIX=\${PLUMED_PREFIX}, CUDA=\${CUDA_HOME}, MPI=\${MPI_PROVIDER}"
+if [[ "\${MPI_PROVIDER}" == "system" ]]; then
+  echo "External/system MPI is reused from \${MPI_ROOT}. Load the same site MPI/module environment used for the build if that MPI has transitive runtime dependencies outside its prefix."
+fi
 EOF
   fi
   chmod +x "${out}"
-  printf '%s\n' "${out}"
+  printf '%s
+' "${out}"
 }
 
 write_rc_block() {
-  # write_rc_block <rcfile>
   local rcfile="${1}"
-  local rc_kind="CUDA/PLUMED"
-  is_gromacs_only && rc_kind="CUDA/GROMACS-only"
+  local rc_kind
+  if is_cpu_only; then
+    rc_kind="CPU/PLUMED"
+    is_gromacs_only && rc_kind="CPU/GROMACS-only"
+  else
+    rc_kind="CUDA/PLUMED"
+    is_gromacs_only && rc_kind="CUDA/GROMACS-only"
+  fi
   local start="# >>> ${NAME} ${rc_kind} env (managed by ${SCRIPT_NAME}) >>>"
   local end="# <<< ${NAME} ${rc_kind} env <<<"
   touch "${rcfile}"
 
-  # Replace any previous managed block for this NAME (idempotent re-runs).
   if grep -qF "${start}" "${rcfile}"; then
     local es ee
     es="$(regex_escape "${start}")"
@@ -4229,47 +6144,138 @@ integrate_shell_rc() {
 ###############################################################################
 print_config() {
   section "Build configuration"
-  printf '  %-22s : %s\n' "Script version" "${SCRIPT_VERSION}"
-  printf '  %-22s : %s\n' "Script dir"     "${SCRIPT_DIR}"
-  printf '  %-22s : %s\n' "Build mode"     "${BUILD_MODE}"
-  printf '  %-22s : %s\n' "CUDA toolkit"   "${CUDA_HOME} (v${CUDA_VERSION})"
-  printf '  %-22s : %s\n' "CUDA compiler"  "${CUDACXX:-${CUDA_HOME}/bin/nvcc}"
-  printf '  %-22s : %s\n' "Parent dir"     "${DIR}"
-  printf '  %-22s : %s\n' "Env name"       "${NAME}"
-  printf '  %-22s : %s\n' "Install root"   "${INSTALL_ROOT}"
-  printf '  %-22s : %s\n' "Sources"        "${SRC}"
-  printf '  %-22s : %s\n' "Checkpoints"    "${CKPT_DIR}"
-  printf '  %-22s : %s\n' "Activation alias" "${ALIAS_NAME}"
-  printf '  %-22s : %s\n' "CUDA arch(s)"   "${CUDA_ARCHS}"
-  printf '  %-22s : %s\n' "Parallel jobs"  "${NPROC}"
-  if is_full_stack; then
-    printf '  %-22s : %s\n' "PLUMED ref"     "${PLUMED_REF}"
-    printf '  %-22s : %s\n' "PLUMED Python"  "$([[ "${PLUMED_DISABLE_PYTHON}" == "1" ]] && echo disabled || echo enabled)"
-    printf '  %-22s : %s\n' "PLUMED patch dir" "$(resolve_plumed_patch_dir 2>/dev/null || printf '%s' "${PLUMED_PATCH_DIR}")"
-    printf '  %-22s : %s\n' "SAXS override"   "${PLUMED_SAXS_CPP:-auto-detect}"
+  printf '  %-22s : %s
+' "Script version" "${SCRIPT_VERSION}"
+  printf '  %-22s : %s
+' "Script dir"     "${SCRIPT_DIR}"
+  printf '  %-22s : %s
+' "Build mode"     "${BUILD_MODE}"
+  printf '  %-22s : %s
+' "Accelerator"    "${ACCELERATOR}"
+  if is_cpu_only; then
+    printf '  %-22s : %s
+' "CUDA toolkit"   "not used"
+    printf '  %-22s : %s
+' "CUDA compiler"  "not applicable"
+  elif [[ "${PREFETCH}" -eq 1 && "${CUDA_VERSION}" == "not-required-for-prefetch" ]]; then
+    printf '  %-22s : %s
+' "CUDA toolkit"   "not required for source prefetch"
+    printf '  %-22s : %s
+' "CUDA compiler"  "not required for source prefetch"
   else
-    printf '  %-22s : %s\n' "PLUMED/ArrayFire" "not built"
+    printf '  %-22s : %s
+' "CUDA toolkit"   "${CUDA_HOME} (v${CUDA_VERSION})"
+    printf '  %-22s : %s
+' "CUDA compiler"  "${CUDACXX:-${CUDA_HOME}/bin/nvcc}"
   fi
-  printf '  %-22s : %s\n' "GROMACS version" "${GROMACS_VERSION}"
-  if is_full_stack; then
-    printf '  %-22s : %s\n' "GROMACS patch" "${PLUMED_GROMACS_PATCH}"
-    printf '  %-22s : %s\n' "GROMACS parallelism" "external MPI"
+  printf '  %-22s : %s
+' "Parent dir"     "${DIR}"
+  printf '  %-22s : %s
+' "Env name"       "${NAME}"
+  printf '  %-22s : %s
+' "Install root"   "${INSTALL_ROOT}"
+  printf '  %-22s : %s
+' "Workspace layout" "$([[ "${SPLIT_LAYOUT}" -eq 1 ]] && echo split || echo legacy)"
+  printf '  %-22s : %s
+' "Work root"      "${WORK_ROOT}"
+  printf '  %-22s : %s
+' "Sources"        "${SRC}"
+  printf '  %-22s : %s
+' "Checkpoints"    "${CKPT_DIR}"
+  printf '  %-22s : %s
+' "Activation alias" "${ALIAS_NAME}"
+  if is_cpu_only; then
+    printf '  %-22s : %s
+' "CUDA arch(s)"   "not applicable"
   else
-    printf '  %-22s : %s\n' "GROMACS patch" "not used"
-    printf '  %-22s : %s\n' "GROMACS parallelism" "thread-MPI (GMX_MPI=OFF)"
+    printf '  %-22s : %s
+' "CUDA arch(s)"   "${CUDA_ARCHS}"
   fi
-  printf '  %-22s : %s\n' "GROMACS SIMD" "${GMX_SIMD}"
-  printf '  %-22s : %s\n' "Auto repair"    "${AUTO_REPAIR}"
-  printf '  %-22s : %s\n' "CUDA shim dir"  "${CUDA_SHIM_DIR}"
-  printf '  %-22s : %s\n' "FFTW -march"    "${MARCH}"
+  printf '  %-22s : %s
+' "Parallel jobs"  "${NPROC}"
+  if [[ "${PREFETCH}" -eq 1 || "${OFFLINE}" -eq 1 ]]; then
+    printf '  %-22s : %s
+' "Source cache" "${SOURCE_CACHE}"
+    printf '  %-22s : %s
+' "Source mode" "$([[ "${PREFETCH}" -eq 1 ]] && echo prefetch || echo offline)"
+  fi
+  printf '  %-22s : %s
+' "C compiler"      "${BUILD_CC:-${CC:-auto}}"
+  printf '  %-22s : %s
+' "C++ compiler"    "${BUILD_CXX:-${CXX:-auto}}"
+  if is_cuda_backend; then
+    printf '  %-22s : %s
+' "CUDA host C++" "${BUILD_CUDAHOSTCXX:-${CUDAHOSTCXX:-auto}}"
+  fi
+  if is_full_stack && ! is_cpu_only; then
+    printf '  %-22s : %s
+' "MPI provider" "${MPI_PROVIDER}"
+    printf '  %-22s : %s
+' "MPI prefix" "${MPI_ROOT}"
+  elif is_gromacs_only || is_cpu_only; then
+    printf '  %-22s : %s
+' "MPI mode" "GROMACS thread-MPI"
+  fi
+  if is_full_stack; then
+    printf '  %-22s : %s
+' "PLUMED ref"     "${PLUMED_REF}"
+    printf '  %-22s : %s
+' "PLUMED Python"  "$([[ "${PLUMED_DISABLE_PYTHON}" == "1" ]] && echo disabled || echo enabled)"
+    if is_cpu_only; then
+      printf '  %-22s : %s
+' "PLUMED ArrayFire" "disabled/not built"
+      printf '  %-22s : %s
+' "SAXS override" "disabled; upstream PLUMED only (CPU bookmark)"
+    else
+      printf '  %-22s : %s
+' "PLUMED patch dir" "$(resolve_plumed_patch_dir 2>/dev/null || printf '%s' "${PLUMED_PATCH_DIR}")"
+      printf '  %-22s : %s
+' "SAXS override"   "${PLUMED_SAXS_CPP:-auto-detect}"
+    fi
+  else
+    printf '  %-22s : %s
+' "PLUMED/ArrayFire" "not built"
+  fi
+  printf '  %-22s : %s
+' "GROMACS version" "${GROMACS_VERSION}"
+  if is_full_stack; then
+    printf '  %-22s : %s
+' "GROMACS patch" "${PLUMED_GROMACS_PATCH}"
+    if is_cpu_only; then
+      printf '  %-22s : %s
+' "GROMACS parallelism" "thread-MPI (GMX_MPI=OFF)"
+    else
+      printf '  %-22s : %s
+' "GROMACS parallelism" "external MPI"
+    fi
+  else
+    printf '  %-22s : %s
+' "GROMACS patch" "not used"
+    printf '  %-22s : %s
+' "GROMACS parallelism" "thread-MPI (GMX_MPI=OFF)"
+  fi
+  printf '  %-22s : %s
+' "GROMACS GPU" "$([[ "${ACCELERATOR}" == cpu ]] && echo OFF || echo CUDA)"
+  printf '  %-22s : %s
+' "GROMACS SIMD" "${GMX_SIMD}"
+  if is_cpu_only; then
+    printf '  %-22s : %s
+' "CUDA auto repair" "not applicable"
+  else
+    printf '  %-22s : %s
+' "Auto repair"    "${AUTO_REPAIR}"
+    printf '  %-22s : %s
+' "CUDA shim dir"  "${CUDA_SHIM_DIR}"
+  fi
+  printf '  %-22s : %s
+' "FFTW -march"    "${MARCH}"
   if [[ "${INSTALL_CUDA}" -eq 1 || "${INSTALL_CMAKE}" -eq 1 ]]; then
-    printf '  %-22s : %s\n' "Toolchain parent" "${TOOLCHAIN_DIR}"
-    if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
-      printf '  %-22s : %s\n' "Private CUDA" "${RESOLVED_CUDA_BOOTSTRAP_VERSION} at ${CUDA_INSTALL_DIR}"
-    fi
-    if [[ "${INSTALL_CMAKE}" -eq 1 ]]; then
-      printf '  %-22s : %s\n' "Private CMake" "${CMAKE_BOOTSTRAP_VERSION} at ${CMAKE_INSTALL_DIR}"
-    fi
+    printf '  %-22s : %s
+' "Toolchain parent" "${TOOLCHAIN_DIR}"
+    if [[ "${INSTALL_CUDA}" -eq 1 ]]; then printf '  %-22s : %s
+' "Private CUDA" "${RESOLVED_CUDA_BOOTSTRAP_VERSION} at ${CUDA_INSTALL_DIR}"; fi
+    if [[ "${INSTALL_CMAKE}" -eq 1 ]]; then printf '  %-22s : %s
+' "Private CMake" "${CMAKE_BOOTSTRAP_VERSION} at ${CMAKE_INSTALL_DIR}"; fi
   fi
 }
 
@@ -4290,53 +6296,124 @@ print_plan() {
 
 print_status() {
   section "Checkpoint status: ${INSTALL_ROOT}"
-  echo "  Build mode: ${BUILD_MODE}"
+  echo "  Build mode : ${BUILD_MODE}"
+  echo "  Accelerator: ${ACCELERATOR}"
+  echo "  Work root  : ${WORK_ROOT}"
+  if [[ -f "${INSTALL_ROOT}/.installer_accelerator" ]]; then
+    echo "  Recorded   : $(head -n1 "${INSTALL_ROOT}/.installer_accelerator" 2>/dev/null || true)"
+  fi
   local s
   for s in "${STAGES[@]}"; do
     if stage_done "${s}"; then
-      printf '  %-10s : %bdone%b   (%s)\n' "${s}" "${C_GRN}" "${C_RST}" \
-        "$(cat "${CKPT_DIR}/${s}.done" 2>/dev/null)"
+      printf '  %-10s : %bdone%b   (%s)
+' "${s}" "${C_GRN}" "${C_RST}" "$(cat "${CKPT_DIR}/${s}.done" 2>/dev/null)"
     else
-      printf '  %-10s : %bpending%b\n' "${s}" "${C_YEL}" "${C_RST}"
+      printf '  %-10s : %bpending%b
+' "${s}" "${C_YEL}" "${C_RST}"
     fi
   done
   if is_full_stack; then
-    local status_src="${INSTALL_ROOT}/src/plumed2" status_saxs status_kernel status_commit
+    local status_src="${SRC}/plumed2" status_saxs status_kernel status_commit
     status_saxs="$(sha256_file "${status_src}/src/isdb/SAXS.cpp" 2>/dev/null || true)"
     status_kernel="$(sha256_file "${INSTALL_ROOT}/plumed/lib/libplumedKernel.so" 2>/dev/null || true)"
     status_commit="$(git -C "${status_src}" rev-parse HEAD 2>/dev/null || true)"
     echo
     echo "  PLUMED/SAXS live state:"
-    printf '  %-22s : %s\n' "PLUMED commit" "${status_commit:-missing}"
-    printf '  %-22s : %s\n' "SAXS source SHA-256" "${status_saxs:-missing}"
-    printf '  %-22s : %s\n' "Kernel SHA-256" "${status_kernel:-missing}"
-    printf '  %-22s : %s\n' "Installation info" "${INSTALL_ROOT}/installation-info.txt"
-    printf '  %-22s : %s\n' "Manifest" "${INSTALL_ROOT}/installation-manifest.json"
-    printf '  %-22s : %s\n' "SAXS update history" "${INSTALL_ROOT}/saxs_updates/history.jsonl"
+    printf '  %-22s : %s
+' "PLUMED commit" "${status_commit:-missing}"
+    printf '  %-22s : %s
+' "SAXS source SHA-256" "${status_saxs:-missing}"
+    printf '  %-22s : %s
+' "Kernel SHA-256" "${status_kernel:-missing}"
+    if is_cpu_only; then
+      printf '  %-22s : %s
+' "SAXS update support" "intentionally disabled for CPU profile"
+    else
+      printf '  %-22s : %s
+' "SAXS update history" "${INSTALL_ROOT}/saxs_updates/history.jsonl"
+    fi
   fi
+  echo
+  printf '  %-22s : %s
+' "Installation info" "${INSTALL_ROOT}/installation-info.txt"
+  printf '  %-22s : %s
+' "Manifest" "${INSTALL_ROOT}/installation-manifest.json"
+}
+
+finalize_installation() {
+  # finalize_installation <last-action>
+  # This phase is deliberately separate from compilation so scheduler timeouts
+  # after make install can be recovered with --finalize-only.
+  local action="${1:-build}"
+
+  if is_full_stack; then
+    if [[ -x "${PLUMED_ROOT}/bin/plumed" ]]; then
+      export PATH="${PLUMED_ROOT}/bin:${PATH}"
+      export LD_LIBRARY_PATH="${PLUMED_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+      final_checks
+    else
+      warn "PLUMED not installed; skipping final PLUMED checks."
+    fi
+  else
+    info "GROMACS-only mode: PLUMED final checks are not applicable."
+  fi
+
+  local final_gmx_bin="${GMX_ROOT}/bin/$(gmx_executable_name)"
+  if [[ -x "${final_gmx_bin}" ]]; then
+    final_gromacs_checks
+  else
+    warn "GROMACS not installed; skipping final GROMACS checks."
+  fi
+
+  postflight_stack_checks
+  validate_split_runtime_independence
+  generate_activate_script >/dev/null
+  integrate_shell_rc
+  persist_postbuild_provenance
+  write_installation_reports "${action}"
+  print_done_banner
 }
 
 print_done_banner() {
   section "Build completed successfully"
   echo "  Install root : ${INSTALL_ROOT}"
+  echo "  Work root    : ${WORK_ROOT}"
   echo "  GROMACS      : ${GMX_ROOT}"
   echo "  FFTW         : ${FFTW_ROOT}"
-  echo "  CUDA         : ${CUDA_HOME}"
+  echo "  Accelerator  : ${ACCELERATOR}"
+  if is_cpu_only; then
+    echo "  CUDA         : not used"
+  else
+    echo "  CUDA         : ${CUDA_HOME}"
+  fi
   [[ -z "${CMAKE_ROOT:-}" ]] || echo "  CMake        : ${CMAKE_ROOT}"
   if is_full_stack; then
     echo "  PLUMED       : ${PLUMED_ROOT}"
     echo "  PLUMED kernel: ${PLUMED_KERNEL}"
-    echo "  ArrayFire    : ${AF_ROOT}"
-    echo "  fmt          : ${FMT_ROOT}"
-    echo "  OpenMPI      : ${MPI_ROOT}"
+    if is_cpu_only; then
+      echo "  ArrayFire    : not built"
+      echo "  OpenMPI      : not built (thread-MPI GROMACS)"
+      echo "  SAXS update  : custom CPU development/update intentionally unsupported"
+    else
+      echo "  ArrayFire    : ${AF_ROOT}"
+      echo "  fmt          : ${FMT_ROOT}"
+      echo "  MPI          : ${MPI_ROOT} (${MPI_PROVIDER})"
+    fi
   else
-    echo "  Build mode   : GROMACS-only (thread-MPI; no PLUMED/ArrayFire/OpenMPI/Boost/fmt/spdlog)"
+    if is_cpu_only; then
+      echo "  Build mode   : CPU GROMACS-only (thread-MPI; no CUDA/PLUMED/ArrayFire/OpenMPI)"
+    else
+      echo "  Build mode   : GROMACS-only (thread-MPI; no PLUMED/ArrayFire/OpenMPI/Boost/fmt/spdlog)"
+    fi
   fi
   echo "  Log file     : ${LOG_FILE}"
   echo
   echo "  Activate this environment with:"
   echo "      source \"${INSTALL_ROOT}/activate.sh\""
-  if is_gromacs_only; then
+  if is_cpu_only; then
+    echo "      gmx --version"
+    if is_full_stack; then echo "      gmx mdrun -h | grep -i plumed"; fi
+  elif is_gromacs_only; then
     echo "      gmx --version"
     echo "      gmx mdrun -ntmpi 1 -nb gpu -pme gpu -bonded gpu -update gpu"
   else
@@ -4349,22 +6426,58 @@ print_done_banner() {
   fi
 }
 
-###############################################################################
-# Main
-###############################################################################
 main() {
   setup_colors
   parse_args "$@"
-  setup_colors   # re-apply in case --no-color was passed
+  setup_colors
   configure_build_mode
   validate_args
+  resolve_source_cache_path
+  prepare_offline_cmake_archive
 
-  # The incremental path deliberately does not auto-detect CUDA or resolve new
-  # component versions. It sources the selected installation's activate.sh and
-  # reuses the exact dependency/toolchain prefixes recorded there.
+  # SAXS updates intentionally remain tied to the validated CUDA/ArrayFire
+  # installation. setup_saxs_update_environment also checks the persisted
+  # accelerator marker so a CPU install cannot be updated accidentally.
   if [[ "${UPDATE_SAXS}" -eq 1 ]]; then
     resolve_paths
     run_saxs_update
+    return 0
+  fi
+
+  if [[ "${FINALIZE_ONLY}" -eq 1 ]]; then
+    # --name is mandatory for this route, so resolve_paths does not need CUDA
+    # to construct the installation name. Restore persisted route/MPI metadata
+    # before reconstructing the runtime environment.
+    resolve_paths
+    [[ -d "${INSTALL_ROOT}" ]] || die "Existing installation not found for --finalize-only: ${INSTALL_ROOT}"
+    load_persisted_install_profile
+    resolve_paths
+    conda deactivate 2>/dev/null || true
+    resolve_build_compilers
+    if is_cpu_only; then
+      CUDA_HOME=""
+      CUDA_VERSION="not-used"
+      CUDA_ARCHS="not-applicable"
+    else
+      detect_cuda
+      resolve_cuda_archs
+    fi
+    if [[ "${GROMACS_VERSION}" == "auto" ]]; then
+      local existing_gmx_src=""
+      existing_gmx_src="$(find "${SRC}" -maxdepth 1 -type d -name 'gromacs-*' -print 2>/dev/null | sort | head -n1 || true)"
+      if [[ -n "${existing_gmx_src}" ]]; then
+        GROMACS_VERSION="${existing_gmx_src##*/gromacs-}"
+      fi
+    fi
+    mkdir -p "${LOG_DIR}"
+    LOG_FILE="${LOG_DIR}/finalize_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
+    exec > >(tee -a "${LOG_FILE}") 2>&1
+    info "Finalization-only log: ${LOG_FILE}"
+    setup_environment
+    if is_full_stack && is_cuda_backend && using_system_mpi; then
+      validate_system_mpi_selection
+    fi
+    finalize_installation "finalize-only"
     return 0
   fi
 
@@ -4374,69 +6487,124 @@ main() {
     toolchain_bootstrap_preflight
   fi
 
-  if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
-    # Resolve install/checkpoint paths before downloading the toolkit. The real
-    # CUDA installation happens only after the target install-root guard passes.
+  if is_cpu_only; then
+    CUDA_HOME=""
+    CUDA_VERSION="not-used"
+    CUDA_ARCHS="not-applicable"
+  elif [[ "${INSTALL_CUDA}" -eq 1 ]]; then
     CUDA_HOME="${CUDA_INSTALL_DIR}"
     CUDA_VERSION="${RESOLVED_CUDA_BOOTSTRAP_VERSION}"
     CUDA_PATH="${CUDA_INSTALL_DIR}"
     export CUDA_HOME
     export CUDA_ROOT="${CUDA_HOME}"
     export CUDACXX="${CUDA_HOME}/bin/nvcc"
+  elif [[ "${PREFETCH}" -eq 1 && "${GROMACS_VERSION}" != "auto" ]]; then
+    # Source-only prefetch with an explicitly selected GROMACS version does not
+    # compile CUDA code and therefore must not require a CUDA toolkit or GPU.
+    CUDA_HOME=""
+    CUDA_VERSION="not-required-for-prefetch"
+    CUDA_ARCHS="not-required-for-prefetch"
+    unset CUDA_ROOT CUDACXX 2>/dev/null || true
   else
+    # Normal builds, finalization, and CUDA prefetch with GROMACS_VERSION=auto
+    # retain the established CUDA detection policy because auto-selection of
+    # GROMACS 2025.x vs 2024.6 depends on the target CUDA version.
     detect_cuda
   fi
   resolve_paths
 
   if [[ "${DO_STATUS}" -eq 1 ]]; then
+    if [[ -d "${INSTALL_ROOT}" ]]; then load_persisted_install_profile; resolve_paths; fi
     print_status
     exit 0
   fi
 
+  resolve_build_compilers
+
+  # Prefetch is a source-acquisition-only operation. Resolve the same GROMACS
+  # selection as a build, populate/verify the shared cache, then exit without
+  # touching <dir>/<name>.
+  if [[ "${PREFETCH}" -eq 1 ]]; then
+    # Source acquisition is architecture-independent. Never probe a GPU in
+    # prefetch mode; login/data-transfer nodes frequently have no GPU device.
+    if is_cuda_backend; then CUDA_ARCHS="not-required-for-prefetch"; else CUDA_ARCHS="not-applicable"; fi
+    # Prefetch also does not need an operational MPI installation. Keep only a
+    # descriptive prefix for configuration reporting and source-plan selection.
+    if using_system_mpi; then
+      MPI_ROOT="${MPI_PREFIX:-not-required-for-prefetch}"
+    else
+      MPI_ROOT="${INSTALL_ROOT}/openmpi"
+    fi
+    resolve_gromacs_selection
+    validate_gromacs_2025_compiler
+    print_config
+    section "Source cache plan"
+    source_cache_required_files | sed 's/^/  /'
+    if is_full_stack && ! is_cpu_only; then
+      printf '  %s\n' "archives/arrayfire-full-${ARRAYFIRE_VERSION}.tar.bz2  (prefetch input/provenance; extern payload is embedded in the composite ArrayFire snapshot)"
+    fi
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      info "Prefetch dry run complete; no cache files were written."
+      return 0
+    fi
+    prefetch_sources
+    return 0
+  fi
+
+  if [[ "${OFFLINE}" -eq 1 ]]; then
+    # GROMACS_VERSION must be resolved before we can know the exact required
+    # cache artifact set. The final compiler compatibility check still occurs
+    # again after environment setup, as in normal v34 builds.
+    setup_environment
+    resolve_gromacs_selection
+    verify_source_cache
+  fi
+
   check_install_dir
+  check_work_dir
 
   if [[ "${DRY_RUN}" -eq 0 ]]; then
-    # Create the tree early so the rootless auto-repair layer can place private
-    # compatibility shims inside the install root before preflight/configuration.
-    mkdir -p "${INSTALL_ROOT}" "${SRC}" "${LOG_DIR}" "${CKPT_DIR}"
-    printf '%s\n' "${BUILD_MODE}" > "${INSTALL_ROOT}/.installer_build_mode"
+    mkdir -p "${INSTALL_ROOT}" "${WORK_ROOT}" "${SRC}" "${LOG_DIR}" "${CKPT_DIR}"
+    persist_workspace_profile
     LOG_FILE="${LOG_DIR}/build_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
     exec > >(tee -a "${LOG_FILE}") 2>&1
     info "Logging to ${LOG_FILE}"
 
-    # Avoid Conda contaminating compiler/library discovery (no-op if absent).
     conda deactivate 2>/dev/null || true
+    # conda/module hooks can rewrite compiler variables. Restore caller intent.
+    resolve_build_compilers
 
-    # Bootstrap only after the install-root guard and after logging is active.
-    # This prevents multi-GB downloads when the selected environment name would
-    # be rejected, and records the bootstrap in the normal build log.
     install_private_cmake
-    install_private_cuda
-    if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
-      detect_cuda
+    if is_cuda_backend; then
+      install_private_cuda
+      if [[ "${INSTALL_CUDA}" -eq 1 ]]; then detect_cuda; fi
     fi
     if [[ -n "${CMAKE_ROOT:-}" && -x "${CMAKE_ROOT}/bin/cmake" ]]; then
       export PATH="${CMAKE_ROOT}/bin:${PATH}"
     fi
 
-    ensure_cuda_development_layout
+    if is_cuda_backend; then
+      ensure_cuda_development_layout
+    fi
   else
-    # Dry-run should not write shims or private toolchains.
     if [[ "${INSTALL_CUDA}" -eq 1 || "${INSTALL_CMAKE}" -eq 1 ]]; then
       info "Dry run: private toolchain directories/downloads will not be created."
     fi
-    if [[ "${INSTALL_CUDA}" -eq 0 ]] && needs_cuda_shim; then
+    if is_cuda_backend && [[ "${INSTALL_CUDA}" -eq 0 ]] && needs_cuda_shim; then
       warn "CUDA appears to use a split/non-standard layout. A real run will create a private CUDA shim under the install root."
     fi
   fi
 
-  resolve_cuda_archs
+  if is_cuda_backend; then
+    resolve_cuda_archs
+  else
+    CUDA_ARCHS="not-applicable"
+  fi
 
-  # Set path variables before resolving the GROMACS auto-selection, because the
-  # compiler check should inspect the MPI wrapper from this environment.
   setup_environment
   if should_run gromacs; then
     resolve_gromacs_selection
+    validate_gromacs_2025_compiler
   fi
 
   print_config
@@ -4445,12 +6613,11 @@ main() {
     preflight
     print_plan
     section "Activation script preview (not written in --dry-run)"
-    echo "Would write: ${INSTALL_ROOT}/activate.sh (${BUILD_MODE})"
+    echo "Would write: ${INSTALL_ROOT}/activate.sh (${BUILD_MODE}, accelerator=${ACCELERATOR})"
     echo "Would add alias '${ALIAS_NAME}' to:"
     [[ "${WRITE_BASHRC}" -eq 1 ]]  && echo "  ${HOME}/.bashrc"
     [[ "${WRITE_ALIASES}" -eq 1 ]] && echo "  ${HOME}/.bash_aliases"
-    [[ "${WRITE_BASHRC}" -eq 0 && "${WRITE_ALIASES}" -eq 0 ]] \
-      && echo "  (no shell rc requested; use --write-bashrc/--write-aliases)"
+    [[ "${WRITE_BASHRC}" -eq 0 && "${WRITE_ALIASES}" -eq 0 ]] && echo "  (no shell rc requested; use --write-bashrc/--write-aliases)"
     echo
     info "Dry run complete; nothing was built or written."
     exit 0
@@ -4458,14 +6625,12 @@ main() {
 
   preflight
   setup_environment
-
+  persist_install_profile
   print_plan
 
   local s
   for s in "${STAGES[@]}"; do
     if should_run "${s}"; then
-      # A rebuild attempt must not retain a stale success checkpoint if the
-      # selected stage fails part-way through.
       rm -f -- "${CKPT_DIR}/${s}.done"
       run_stage "${s}"
     else
@@ -4473,33 +6638,7 @@ main() {
     fi
   done
 
-  # If we only built a subset, PLUMED/GROMACS may not be present yet; guard final checks.
-  if is_full_stack; then
-    if [[ -x "${PLUMED_ROOT}/bin/plumed" ]]; then
-      export PATH="${PLUMED_ROOT}/bin:${PATH}"
-      export LD_LIBRARY_PATH="${PLUMED_ROOT}/lib:${LD_LIBRARY_PATH:-}"
-      final_checks
-    else
-      warn "PLUMED not installed in this run; skipping final PLUMED checks."
-    fi
-  else
-    info "GROMACS-only mode: PLUMED final checks are not applicable."
-  fi
-
-  local final_gmx_bin="${GMX_ROOT}/bin/$(gmx_executable_name)"
-  if [[ -x "${final_gmx_bin}" ]]; then
-    final_gromacs_checks
-  else
-    warn "GROMACS not installed in this run; skipping final GROMACS checks."
-  fi
-
-  postflight_stack_checks
-  generate_activate_script >/dev/null
-  integrate_shell_rc
-  if is_full_stack && [[ -x "${PLUMED_ROOT}/bin/plumed" ]]; then
-    write_installation_reports "build"
-  fi
-  print_done_banner
+  finalize_installation "build"
 }
 
 on_err() {
