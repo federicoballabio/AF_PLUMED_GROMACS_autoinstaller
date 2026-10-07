@@ -1,80 +1,12 @@
 #!/usr/bin/env bash
-###############################################################################
-# Generalized CUDA / OpenMPI / FFTW / Boost / spdlog / ArrayFire / PLUMED / GROMACS build
-#
-# Default route: builds a self-contained scientific software stack with an
-# ArrayFire CUDA backend, PLUMED (ISDB/SAXS + ArrayFire CUDA), and a
-# PLUMED-patched external-MPI GROMACS installation.
-#
-# Optional --gromacs-only route: builds only FFTW and standalone GROMACS,
-# with external MPI disabled and built-in thread-MPI enabled. CUDA remains the
-# default backend; combine with --cpu-only for a CUDA-free analysis build.
-#
-# Key features vs. the original recipe:
-#   * CUDA toolkit is auto-detected, or given explicitly with --cuda <path>.
-#   * v32 can optionally bootstrap a private CUDA Toolkit (never the driver)
-#     and/or a private CMake into a user-controlled path for rootless HPC use.
-#   * v33 adds an opt-in --cpu-only backend for lightweight login-node installs:
-#     GROMACS-only or PLUMED-patched GROMACS, both with thread-MPI and no CUDA.
-#     The established CUDA routes remain the default and are preserved.
-#   * v34 hardens compiler propagation and the CUDA + external-MPI route without
-#     changing established build modes/defaults. Explicit CC/CXX selections are
-#     preserved across conda deactivation, OpenMPI wrapper provenance is checked,
-#     MPI include paths are propagated to CUDA compilation, and PLUMED/SAXS
-#     provenance plus patch-reject handling are strengthened.
-#   * v34.1 adds an opt-in offline source-cache workflow for HPC systems whose
-#     compute nodes cannot access the Internet. --prefetch populates a shared
-#     cache on a networked node; --offline consumes only verified cached sources.
-#     Normal online build behavior is unchanged unless these options are used.
-#   * v34.2 adds an opt-in system/external-MPI provider, makes ArrayFire offline
-#     caches self-contained with the full dependency payload, adds resumable
-#     finalization, and makes final MPI checks launcher-aware and time-limited.
-#     Existing private-OpenMPI and online routes remain the defaults.
-#   * v34.2.1 makes source-only prefetch independent of GPU visibility and CUDA
-#     architecture resolution when the GROMACS version is explicitly selected.
-#   * Install location is composed from --dir <parent> and --name <env-name>;
-#     everything lands under <dir>/<name>.
-#   * A checkpoint system lets the build resume from the last completed stage
-#     (or from/at an explicit stage) instead of restarting from scratch.
-#   * Optional activation alias written into ~/.bashrc or ~/.bash_aliases.
-#   * Preflight checks for write permission and required tooling.
-#   * Optional PLUMED/SAXS source overrides can live in plumed_patch next to
-#     this installer, so fresh builds patch SAXS.cpp before compiling PLUMED.
-#   * A dedicated --update-saxs route reuses an existing configured PLUMED
-#     checkout, incrementally rebuilds/installs only PLUMED, and never touches
-#     the GROMACS source, build, installation, or checkpoints.
-#   * v31 preserves the retained PLUMED Python-wrapper capability and repairs
-#     missing/shadowed PyPA build tooling privately under the install root.
-#   * v31 snapshots the complete installed PLUMED prefix plus the pre-update
-#     tracked source state and restores them transactionally if the update fails.
-#   * Rootless HPC operation is an explicit invariant: no sudo/system package
-#     manager is invoked and no system software prefix is modified.
-#   * Persistent install reports, source/kernel hashes, update history, and
-#     out-of-tree backups make later SAXS development updates reproducible.
-#   * GROMACS is built after PLUMED, so an existing successful PLUMED build can
-#     be reused and the new run can continue directly with the gromacs stage.
-#
-# Quick start:
-#   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv
-#   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --arch 90 -j 16 \
-#                            --write-bashrc
-#   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --from gromacs
-#   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --update-saxs
-#
-# See --help for all options.
-###############################################################################
 
 set -Eeuo pipefail
 umask 022
 
 SCRIPT_NAME="$(basename "${0}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-SCRIPT_VERSION="7.0-gmx-auto-v35-split-workspace-system-mpi-offline-finalize-transactional-saxs"
+SCRIPT_VERSION="8.1-gmx-auto-v36.1-manifest-plumed-patch-reporting"
 
-###############################################################################
-# Component versions (override from the environment if needed, e.g.
-#   BOOST_VERSION=1.86.0 ./af_plumed_build.sh ...).
-###############################################################################
 OPENMPI_VERSION="${OPENMPI_VERSION:-5.0.10}"
 FFTW_VERSION="${FFTW_VERSION:-3.3.11}"
 BOOST_VERSION="${BOOST_VERSION:-1.85.0}"
@@ -82,27 +14,19 @@ FMT_VERSION="${FMT_VERSION:-11.2.0}"
 SPDLOG_VERSION="${SPDLOG_VERSION:-1.9.2}"
 ARRAYFIRE_VERSION="${ARRAYFIRE_VERSION:-3.9.0}"
 PLUMED_REPO="${PLUMED_REPO:-https://github.com/plumed/plumed2.git}"
-# Disable PLUMED Python wrappers by default. The core PLUMED library, plumed driver,
-# and GROMACS mdrun -plumed do not need Python.h / python3-dev.
+
 PLUMED_DISABLE_PYTHON="${PLUMED_DISABLE_PYTHON:-1}"
-# Optional local PLUMED source overrides for development/testing. By default the
-# script first looks for plumed_patch next to this installer script, then for
-# <install-root>/plumed_patch. It accepts SAXS.cpp either directly in that folder
-# or as src/isdb/SAXS.cpp inside it, and copies it over src/isdb/SAXS.cpp
-# immediately after cloning PLUMED and before the first PLUMED compilation.
+
 PLUMED_PATCH_DIR="${PLUMED_PATCH_DIR:-auto}"
 PLUMED_SAXS_CPP="${PLUMED_SAXS_CPP:-}"
+PLUMED_PATCH_BUNDLE="${PLUMED_PATCH_BUNDLE:-}"
+UPDATE_PLUMED_PATCH=0
+LAST_PLUMED_PATCH_BUNDLE=""
+LAST_PLUMED_PATCH_MANIFEST_SHA256=""
 
-# Rootless auto-repair layer for heterogeneous/HPC installations.  This keeps
-# normal /usr/local/cuda-style installs untouched, but can create a private CUDA
-# shim when CUDA is installed in Debian/Ubuntu split locations such as
-# /usr/bin/nvcc + /usr/include + /usr/lib/x86_64-linux-gnu.  The shim only
-# contains symlinks inside the install root; no system files are modified.
 AUTO_REPAIR="${AUTO_REPAIR:-1}"
 CUDA_SHIM_DIR="${CUDA_SHIM_DIR:-auto}"
 
-# Optional rootless toolchain bootstrap (v32). Disabled by default, preserving
-# all existing behavior. These paths may point anywhere writable by the user.
 INSTALL_CUDA=0
 INSTALL_CMAKE=0
 TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-}"
@@ -120,78 +44,57 @@ TOOLCHAIN_DOWNLOAD_DIR=""
 RESOLVED_CUDA_BOOTSTRAP_VERSION=""
 RESOLVED_NVIDIA_DRIVER_VERSION=""
 
-# Optional extra search locations for unusual CUDA packages.  Separate entries
-# with ':' like PATH, e.g. CUDA_EXTRA_INCLUDE_DIRS=/opt/cuda/include:/foo/include.
 CUDA_EXTRA_INCLUDE_DIRS="${CUDA_EXTRA_INCLUDE_DIRS:-}"
 CUDA_EXTRA_LIB_DIRS="${CUDA_EXTRA_LIB_DIRS:-}"
 
-# Default GROMACS selection is automatic:
-#   * GCC/G++ 11+ and CUDA >=12.1 -> GROMACS 2025.4, patched with gromacs-2025.0
-#   * GCC/G++ <11 or CUDA <12.1   -> GROMACS 2024.6, patched with gromacs-2024.3
-# Override with GROMACS_VERSION=2025.4/2024.6 or --gromacs-version <v>.
 GROMACS_VERSION="${GROMACS_VERSION:-auto}"
 GROMACS_URL="${GROMACS_URL:-}"
 GROMACS_FTP_URL="${GROMACS_FTP_URL:-}"
 PLUMED_GROMACS_PATCH="${PLUMED_GROMACS_PATCH:-auto}"
 GMX_SIMD="${GMX_SIMD:-AVX2_256}"
 
-# CPU tuning for FFTW (and -O3 native by default). On heterogeneous HPC clusters
-# where the build node differs from compute nodes, set MARCH to a common
-# baseline, e.g. MARCH=x86-64-v3 to stay portable.
 MARCH="${MARCH:-native}"
 
-# Ordered build-stage routes used by the checkpoint system. The established
-# CUDA full stack remains the default. CPU full mode deliberately omits
-# OpenMPI/Boost/fmt/spdlog/ArrayFire and builds FFTW + PLUMED + GROMACS.
 FULL_STAGES=(openmpi fftw boost fmt spdlog arrayfire plumed gromacs)
 SYSTEM_MPI_FULL_STAGES=(fftw boost fmt spdlog arrayfire plumed gromacs)
 CPU_FULL_STAGES=(fftw plumed gromacs)
 GROMACS_ONLY_STAGES=(fftw gromacs)
 STAGES=("${FULL_STAGES[@]}")
 
-###############################################################################
-# Argument defaults
-###############################################################################
-CUDA_PATH="auto"           # --cuda (auto or explicit toolkit root)
-DIR=""                     # --dir   (required; install parent)
-NAME=""                    # --name  (default: build_<cudaver>)
-WORK_DIR="${WORK_DIR:-}"    # --work-dir (optional workspace parent; split layout)
+CUDA_PATH="auto"
+DIR=""
+NAME=""
+WORK_DIR="${WORK_DIR:-}"
 WORK_DIR_EXPLICIT=0
 WORK_ROOT=""
 SPLIT_LAYOUT=0
-NPROC="${NPROC:-}"         # -j/--jobs
-CUDA_ARCHS="${CUDA_ARCHS:-auto}"   # --arch  (auto, 80, or "70;80;90")
-PLUMED_REF="${PLUMED_REF:-master}"  # --plumed-ref
-FROM_STAGE=""              # --from
-ONLY_STAGE=""              # --only
-FORCE=0                    # --force
-WRITE_BASHRC=0             # --write-bashrc
-WRITE_ALIASES=0            # --write-aliases
-DO_STATUS=0                # --status
-DRY_RUN=0                  # --dry-run
-ASSUME_YES=0              # -y/--yes: assume "yes" (e.g. reuse a non-empty dir)
-NO_COLOR="${NO_COLOR:-0}"  # --no-color
-BUILD_MODE="${BUILD_MODE:-full}"  # full | gromacs-only
+NPROC="${NPROC:-}"
+CUDA_ARCHS="${CUDA_ARCHS:-auto}"
+PLUMED_REF="${PLUMED_REF:-master}"
+FROM_STAGE=""
+ONLY_STAGE=""
+FORCE=0
+WRITE_BASHRC=0
+WRITE_ALIASES=0
+DO_STATUS=0
+DRY_RUN=0
+ASSUME_YES=0
+NO_COLOR="${NO_COLOR:-0}"
+BUILD_MODE="${BUILD_MODE:-full}"
 BUILD_MODE_EXPLICIT=0
-ACCELERATOR="${ACCELERATOR:-cuda}"  # cuda | cpu; CUDA remains the default
-UPDATE_SAXS=0              # --update-saxs: incremental PLUMED/SAXS update
-ALLOW_DIRTY_PLUMED=0       # --allow-dirty-plumed: permit other tracked edits
-RUN_INSTALLCHECK=0         # --installcheck: run PLUMED's installed regtests
-FINALIZE_ONLY=0            # --finalize-only: rerun post-install validation/reporting only
+ACCELERATOR="${ACCELERATOR:-cuda}"
+UPDATE_SAXS=0
+ALLOW_DIRTY_PLUMED=0
+RUN_INSTALLCHECK=0
+FINALIZE_ONLY=0
 
-# External/system MPI is opt-in. The established default remains a private
-# OpenMPI build below <install-root>/openmpi. With --use-system-mpi the caller
-# supplies (or exposes on PATH) an existing OpenMPI-compatible installation.
-MPI_PROVIDER="${MPI_PROVIDER:-private}"   # private | system
+MPI_PROVIDER="${MPI_PROVIDER:-private}"
 MPI_PREFIX="${MPI_PREFIX:-}"
 MPI_PROVIDER_EXPLICIT=0
 MPI_PREFIX_EXPLICIT=0
 MPI_RUNTIME_TIMEOUT="${MPI_RUNTIME_TIMEOUT:-30}"
 ARRAYFIRE_FULL_SOURCE_URL="${ARRAYFIRE_FULL_SOURCE_URL:-}"
 
-# v34 compiler intent capture. Some conda/module hooks alter CC/CXX during
-# deactivation. Preserve what the caller explicitly selected at script startup
-# and re-export the resolved executables before any build stage.
 REQUESTED_CC="${CC:-}"
 REQUESTED_CXX="${CXX:-}"
 REQUESTED_FC="${FC:-}"
@@ -203,17 +106,12 @@ BUILD_CUDAHOSTCXX=""
 PLUMED_PATCH_REJECT_STATUS="none"
 PLUMED_PATCH_REJECT_FILES=""
 
-# v34.1 opt-in source cache.  PREFETCH runs only source acquisition and exits;
-# OFFLINE forbids network source acquisition and copies/extracts only from the
-# verified cache.  SOURCE_CACHE defaults to <dir>/source_cache when either mode
-# is requested.
 PREFETCH=0
 OFFLINE=0
 SOURCE_CACHE="${SOURCE_CACHE:-}"
 SOURCE_CACHE_MANIFEST=""
 SOURCE_CACHE_SHA256=""
 
-# SAXS-update state used for automatic failure rollback.
 CURRENT_OPERATION="build"
 SAXS_UPDATE_ACTIVE=0
 SAXS_UPDATE_BACKUP_DIR=""
@@ -240,8 +138,23 @@ SAXS_UPDATE_PYTHON_PIP_DIR=""
 SAXS_UPDATE_TRACKED_DIRTY_LIST=""
 SAXS_UPDATE_TRACKED_DIRTY_ARCHIVE=""
 SAXS_UPDATE_TRACKED_MISSING_LIST=""
+PATCH_UPDATE_ACTIVE=0
+PATCH_UPDATE_BACKUP_DIR=""
+PATCH_UPDATE_ID=""
+PATCH_UPDATE_BUNDLE=""
+PATCH_UPDATE_OLD_BUNDLE=""
+PATCH_UPDATE_MANIFEST_SHA256=""
+PATCH_UPDATE_COMMIT=""
+PATCH_UPDATE_PREFIX_SNAPSHOT=""
+PATCH_UPDATE_PREFIX_SNAPSHOT_SHA256=""
+PATCH_UPDATE_TARGET_EXISTING_LIST=""
+PATCH_UPDATE_TARGET_MISSING_LIST=""
+PATCH_UPDATE_TARGET_ARCHIVE=""
+PATCH_UPDATE_OTHER_DIRTY_LIST=""
+PATCH_UPDATE_OTHER_MISSING_LIST=""
+PATCH_UPDATE_OTHER_ARCHIVE=""
+PATCH_UPDATE_FAILURE_HANDLED=0
 
-# Populated later
 CUDA_HOME=""
 CUDA_VERSION=""
 INSTALL_ROOT=""
@@ -253,9 +166,6 @@ CKPT_DIR=""
 GMX_ROOT=""
 ALIAS_NAME=""
 
-###############################################################################
-# Logging helpers
-###############################################################################
 setup_colors() {
   if [[ "${NO_COLOR}" != "0" ]] || [[ ! -t 1 ]]; then
     C_RED=""; C_YEL=""; C_GRN=""; C_BLU=""; C_DIM=""; C_RST=""
@@ -272,10 +182,11 @@ err()  { echo "${C_RED}[FAIL]${C_RST} $*" >&2; }
 die()  {
   local message="$*"
   err "${message}"
-  # An explicit exit does not fire Bash's ERR trap. Once an update snapshot is
-  # active, invoke the same rollback path directly so validation failures are
-  # just as recoverable as failed external commands.
-  if [[ "${SAXS_UPDATE_ACTIVE:-0}" -eq 1 ]] \
+
+  if [[ "${PATCH_UPDATE_ACTIVE:-0}" -eq 1 ]] \
+     && declare -F handle_failed_plumed_patch_update >/dev/null 2>&1; then
+    handle_failed_plumed_patch_update 1 "explicit failure: ${message}" "${BASH_LINENO[0]:-unknown}"
+  elif [[ "${SAXS_UPDATE_ACTIVE:-0}" -eq 1 ]] \
      && declare -F handle_failed_saxs_update >/dev/null 2>&1; then
     handle_failed_saxs_update 1 "explicit failure: ${message}" "${BASH_LINENO[0]:-unknown}"
   fi
@@ -289,9 +200,6 @@ section() {
   echo "${C_DIM}#############################################################################${C_RST}"
 }
 
-###############################################################################
-# Usage
-###############################################################################
 usage() {
   cat <<'EOF'
 Usage: af_plumed_gmx_build.sh --dir <parent-dir> [options]
@@ -305,7 +213,7 @@ login-node/analysis build. Existing CUDA behavior remains the default.
 With --update-saxs, reuses the existing configured PLUMED checkout in the
 recorded workspace, replaces only src/isdb/SAXS.cpp, preserves the retained
 PLUMED Python-wrapper setting, performs an incremental PLUMED build/install,
-validates the installed kernel, and leaves GROMACS untouched. If a v35 split
+validates the installed kernel, and leaves GROMACS untouched. If a split
 workspace was removed but its durable source cache/provenance is still present,
 the PLUMED checkout is reconstructed and reconfigured before the transactional
 update. Before make install the complete installed PLUMED prefix is snapshotted
@@ -420,36 +328,29 @@ Private toolchain bootstrap (opt-in; default behavior is unchanged):
                        Parent for private tools/downloads. Default: <dir>/toolchain.
                        On HPC systems this should normally be inside $HOME.
 
-PLUMED/SAXS development:
-  NOTE / BOOKMARK: CPU support for the custom SAXS.cpp development/update
-  workflow is intentionally OUT OF SCOPE. --cpu-only --update-saxs and CPU
-  builds with explicit SAXS overrides are rejected. CPU PLUMED uses upstream
-  SAXS sources only; the validated CUDA/ArrayFire SAXS workflow is unchanged.
-  --update-saxs       Incrementally rebuild/install PLUMED after replacing only
-                       src/isdb/SAXS.cpp in an existing full-stack installation.
-                       --name is required. The default candidate is the
-                       install-owned <install-root>/plumed_patch/SAXS.cpp.
+PLUMED patching:
+  --plumed-patch-bundle <path>
+                       Manifest-driven PLUMED patch bundle. <path> may be a
+                       directory or tar archive containing PATCHFILES.sha256
+                       and plumed2/. Every manifest path and SHA-256 is verified
+                       before files are applied. The complete validated bundle
+                       is retained under the install root for provenance/updates.
+  --update-plumed-patch
+                       Transactionally update an existing full CUDA PLUMED stack
+                       with --plumed-patch-bundle, or with its retained canonical
+                       bundle when no new bundle path is supplied. GROMACS is
+                       verified unchanged. --name is required.
+  --update-saxs       Legacy transactional single-file SAXS.cpp update.
   --plumed-patch-dir <dir>
-                        Directory containing local PLUMED source overrides.
-                        Default: ./plumed_patch next to this installer script
-                        when present; otherwise <install-root>/plumed_patch
-                        when present; otherwise ./plumed_patch next to the script.
-                        For SAXS development, place SAXS.cpp either directly
-                        in this folder or as src/isdb/SAXS.cpp inside it. The
-                        replacement is applied immediately after cloning PLUMED
-                        and before the first PLUMED compilation.
-  --saxs-cpp <path>     Explicit replacement file for PLUMED src/isdb/SAXS.cpp.
-                        This takes precedence over --plumed-patch-dir. In
-                        --update-saxs mode, it is also copied into the canonical
-                        install-owned plumed_patch/SAXS.cpp location.
-  --allow-dirty-plumed  Permit tracked PLUMED source changes other than
-                        src/isdb/SAXS.cpp during --update-saxs. By default such
-                        changes abort the update so they cannot be linked in
-                        accidentally. Generated/untracked build files are okay.
-  --installcheck       After a successful SAXS install, run PLUMED's full
-                       `make installcheck` installed regression-test target.
-                       The default update performs fast build-tree and installed
-                       SAXS/kernel checks; use this option for release updates.
+                       Legacy directory-based SAXS.cpp override.
+  --saxs-cpp <path>   Legacy explicit replacement for src/isdb/SAXS.cpp.
+  --allow-dirty-plumed
+                       Permit unrelated tracked PLUMED source changes during a
+                       PLUMED update. The default aborts on such changes.
+  --installcheck      Run PLUMED make installcheck after a successful PLUMED
+                       source update.
+
+Custom PLUMED patching is disabled in --cpu-only mode.
 
 Auto-repair / HPC compatibility:
   --no-auto-repair     Disable rootless compatibility fixes. By default the script
@@ -460,10 +361,10 @@ Auto-repair / HPC compatibility:
                         Default: <install-root>/cuda-<version>-shim.
 
 Rootless/HPC invariant:
-  The installer never invokes sudo or a system package manager. Persistent
-  components, compatibility shims, SAXS-update rollback snapshots, and Python
-  build tooling provisioned by the installer stay below <install-root>. Normal
-  temporary build files may use the host TMPDIR. Host
+  The installer never invokes sudo or a system package manager. Installed
+  components stay below <install-root>; with --work-dir, build sources,
+  checkpoints, logs, and update snapshots stay below the workspace instead.
+  Normal temporary build files may use the host TMPDIR. Host
   compiler/CMake/Git/CUDA-driver/toolkit prerequisites may come from HPC
   modules, administrator installations, or user-owned prefixes. ~/.bashrc and
   ~/.bash_aliases are touched only when their explicit options are requested.
@@ -485,8 +386,8 @@ Checkpoint / finalization control:
 
 Other:
   --dry-run             Resolve everything and print the selected plan without
-                        building. With --update-saxs, also prints source,
-                        candidate, commit, and SHA-256 drift without writing.
+                        building. With a PLUMED source update, also prints the
+                        resolved source/patch transaction without writing.
   --no-color            Disable coloured output.
   -y, --yes             Assume "yes": reuse a non-empty install dir instead of
                         aborting (a lighter-weight alternative to --force that
@@ -509,7 +410,9 @@ Examples:
   ./af_plumed_gmx_build.sh --dir /shared/public/build --work-dir $HOME/gmx-work --name myenv \
       --source-cache $HOME/gmx-sources --toolchain-dir $HOME/gmx-toolchain
   ./af_plumed_gmx_build.sh --dir $HOME/sw --name plumed_a100 --arch 80 -j 32 --write-bashrc
-  ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --from gromacs    # continue after PLUMED
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name patched --plumed-patch-bundle /path/to/patch.tar.gz
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name patched --update-plumed-patch --plumed-patch-bundle /path/to/new-patch.tar.gz
+  ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --from gromacs
   mkdir -p $HOME/software/myenv/plumed_patch
   cp /path/to/new/SAXS.cpp $HOME/software/myenv/plumed_patch/SAXS.cpp
   ./af_plumed_gmx_build.sh --dir $HOME/software --name myenv --update-saxs --dry-run
@@ -528,13 +431,9 @@ Examples:
 EOF
 }
 
-###############################################################################
-# Small utilities
-###############################################################################
 abspath() {
   local p="${1}"
-  # Expand a leading ~ that survived as a literal (e.g. from a quoted --dir).
-  # shellcheck disable=SC2088  # intentional literal-tilde detection, not expansion
+
   if [[ "${p}" == "~" ]]; then
     p="${HOME}"
   elif [[ "${p:0:2}" == "~/" ]]; then
@@ -549,7 +448,6 @@ abspath() {
   esac
 }
 
-# Escape a string so it can be used inside a sed BRE address (/.../).
 regex_escape() { printf '%s' "${1}" | sed 's/[.[\*^$/]/\\&/g'; }
 
 sha256_file() {
@@ -629,10 +527,7 @@ compiler_family() {
 }
 
 gromacs_effective_cxx_compiler() {
-  # Full CUDA/PLUMED builds use the locally installed OpenMPI C++ wrapper.
-  # During a fresh build that wrapper does not exist yet, so validate the
-  # selected build compiler; during a resumed build validate the compiler
-  # GROMACS will actually see through mpicxx.
+
   if ! is_cpu_only && ! is_gromacs_only && [[ -x "${MPI_ROOT}/bin/mpicxx" ]]; then
     printf '%s\n' "${MPI_ROOT}/bin/mpicxx"
   else
@@ -705,9 +600,6 @@ stage_index() {
   return 1
 }
 
-###############################################################################
-# v34.1 offline source cache
-###############################################################################
 resolve_source_cache_path() {
   [[ "${PREFETCH}" -eq 1 || "${OFFLINE}" -eq 1 || -n "${SOURCE_CACHE}" ]] || return 0
   if [[ -z "${SOURCE_CACHE}" ]]; then
@@ -736,7 +628,7 @@ source_cache_relpath() {
 }
 
 source_cache_copy_archive() {
-  # source_cache_copy_archive <cache-filename> <destination>
+
   local fname="${1}" out="${2}" cached
   [[ "${OFFLINE}" -eq 1 ]] || return 1
   cached="$(source_cache_archive_path "${fname}")"
@@ -747,7 +639,7 @@ source_cache_copy_archive() {
 }
 
 source_cache_extract_git() {
-  # source_cache_extract_git <component> <cache-key> <destination-directory>
+
   local component="${1}" key="${2}" dest="${3}" cached parent expected expected_commit actual_commit
   cached="$(source_cache_git_path "${key}")"
   [[ -s "${cached}" ]] || die "Offline source cache is missing Git snapshot: ${cached}"
@@ -766,7 +658,7 @@ source_cache_extract_git() {
 
 source_cache_required_files() {
   local us cmake_tag
-  # All routes need FFTW + GROMACS.
+
   printf '%s\n' "archives/fftw-${FFTW_VERSION}.tar.gz"
   printf '%s\n' "archives/gromacs-${GROMACS_VERSION}.tar.gz"
 
@@ -825,7 +717,7 @@ verify_source_cache() {
 }
 
 prefetch_download_first_available() {
-  # prefetch_download_first_available <output> <url1> [url2 ...]
+
   local out="${1}" url
   shift
   mkdir -p "$(dirname "${out}")"
@@ -846,7 +738,7 @@ prefetch_download_first_available() {
 }
 
 prefetch_archive() {
-  # prefetch_archive <component> <version> <filename> <url1> [url2 ...]
+
   local component="${1}" version="${2}" fname="${3}" out
   shift 3
   out="$(source_cache_archive_path "${fname}")"
@@ -869,8 +761,7 @@ prefetch_archive() {
 }
 
 prefetch_git_snapshot() {
-  # prefetch_git_snapshot <component> <cache-key> <url> <ref> <mode>
-  # mode: shallow-branch | recursive-branch | recursive-checkout
+
   local component="${1}" key="${2}" url="${3}" ref="${4}" mode="${5}"
   local work_parent work dest out commit status
   work_parent="$(mktemp -d "${SOURCE_CACHE}/.prefetch-git.XXXXXX")"
@@ -926,7 +817,7 @@ arrayfire_offline_required_dirs() {
 }
 
 validate_arrayfire_full_tree() {
-  # validate_arrayfire_full_tree <arrayfire-source-root>
+
   local root="${1}" d missing=()
   while IFS= read -r d; do
     [[ -d "${root}/extern/${d}" ]] || missing+=("${d}")
@@ -1039,7 +930,7 @@ prefetch_sources() {
   if is_full_stack; then
     prefetch_git_snapshot plumed "plumed2" "${PLUMED_REPO}" "${PLUMED_REF}" recursive-checkout
     plumed_commit="$(tar -xOf "$(source_cache_git_path plumed2)" plumed2/.git/HEAD 2>/dev/null | head -n1 || true)"
-    : "${plumed_commit}"  # provenance is already recorded by prefetch_git_snapshot
+    : "${plumed_commit}"
   fi
 
   prefetch_archive gromacs "${GROMACS_VERSION}" "gromacs-${GROMACS_VERSION}.tar.gz" \
@@ -1056,7 +947,6 @@ prefetch_sources() {
     fi
   fi
 
-  # Append archive provenance after all downloads.
   {
     printf '# schema\t2\n'
     printf '# installer\t%s\n' "${SCRIPT_VERSION}"
@@ -1089,7 +979,6 @@ prepare_offline_cmake_archive() {
   [[ -s "${CMAKE_ARCHIVE}" ]] || die "Offline CMake archive missing from source cache: ${CMAKE_ARCHIVE}"
 }
 
-# Download helper: prefers wget, falls back to curl. Saves to basename in cwd.
 download() {
   local url="${1}" fname
   fname="$(basename "${url}")"
@@ -1110,7 +999,7 @@ download() {
 }
 
 download_to() {
-  # download_to <url> <output-file>
+
   local url="${1}" out="${2}" fname
   mkdir -p "$(dirname "${out}")"
   if [[ "${OFFLINE}" -eq 1 ]]; then
@@ -1133,7 +1022,7 @@ download_to() {
 }
 
 download_first_available() {
-  # download_first_available <output-filename> <url1> [url2 ...]
+
   local fname="${1}" url
   shift
   if [[ "${OFFLINE}" -eq 1 ]]; then
@@ -1161,9 +1050,6 @@ download_first_available() {
   die "Could not download ${fname} from any configured source."
 }
 
-###############################################################################
-# Argument parsing
-###############################################################################
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "${1}" in
@@ -1227,6 +1113,9 @@ parse_args() {
       --plumed-patch-dir=*) PLUMED_PATCH_DIR="${1#*=}"; shift ;;
       --saxs-cpp)     PLUMED_SAXS_CPP="${2:?--saxs-cpp requires a file}"; shift 2 ;;
       --saxs-cpp=*)   PLUMED_SAXS_CPP="${1#*=}"; shift ;;
+      --plumed-patch-bundle) PLUMED_PATCH_BUNDLE="${2:?--plumed-patch-bundle requires a path}"; shift 2 ;;
+      --plumed-patch-bundle=*) PLUMED_PATCH_BUNDLE="${1#*=}"; shift ;;
+      --update-plumed-patch) UPDATE_PLUMED_PATCH=1; CURRENT_OPERATION="update-plumed-patch"; shift ;;
       --update-saxs)  UPDATE_SAXS=1; CURRENT_OPERATION="update-saxs"; shift ;;
       --allow-dirty-plumed) ALLOW_DIRTY_PLUMED=1; shift ;;
       --installcheck) RUN_INSTALLCHECK=1; shift ;;
@@ -1269,8 +1158,8 @@ validate_args() {
 
   if [[ "${FINALIZE_ONLY}" -eq 1 ]]; then
     [[ -n "${NAME}" ]] || die "--finalize-only requires --name to select an existing installation explicitly."
-    [[ "${PREFETCH}" -eq 0 && "${UPDATE_SAXS}" -eq 0 && "${DO_STATUS}" -eq 0 ]] \
-      || die "--finalize-only cannot be combined with --prefetch, --update-saxs, or --status."
+    [[ "${PREFETCH}" -eq 0 && "${UPDATE_SAXS}" -eq 0 && "${UPDATE_PLUMED_PATCH}" -eq 0 && "${DO_STATUS}" -eq 0 ]] \
+      || die "--finalize-only cannot be combined with --prefetch, PLUMED source-update routes, or --status."
     [[ -z "${FROM_STAGE}" && -z "${ONLY_STAGE}" && "${FORCE}" -eq 0 ]] \
       || die "--finalize-only cannot be combined with --from, --only, or --force."
     [[ "${INSTALL_CUDA}" -eq 0 && "${INSTALL_CMAKE}" -eq 0 ]] \
@@ -1281,15 +1170,15 @@ validate_args() {
   [[ ! ( "${PREFETCH}" -eq 1 && "${OFFLINE}" -eq 1 ) ]] \
     || die "--prefetch and --offline are mutually exclusive."
   if [[ "${PREFETCH}" -eq 1 ]]; then
-    [[ "${UPDATE_SAXS}" -eq 0 && "${DO_STATUS}" -eq 0 ]] \
-      || die "--prefetch cannot be combined with --update-saxs or --status."
+    [[ "${UPDATE_SAXS}" -eq 0 && "${UPDATE_PLUMED_PATCH}" -eq 0 && "${DO_STATUS}" -eq 0 ]] \
+      || die "--prefetch cannot be combined with PLUMED source-update routes or --status."
     [[ -z "${FROM_STAGE}" && -z "${ONLY_STAGE}" ]] \
       || die "--prefetch creates a complete cache for the selected build route; do not combine it with --from/--only."
     [[ "${WRITE_BASHRC}" -eq 0 && "${WRITE_ALIASES}" -eq 0 ]] \
       || die "--prefetch does not modify shell aliases; omit --write-bashrc/--write-aliases."
   fi
   if [[ "${OFFLINE}" -eq 1 ]]; then
-    [[ "${UPDATE_SAXS}" -eq 0 ]] || die "--offline is not used by --update-saxs; that route reuses an existing source tree."
+    [[ "${UPDATE_SAXS}" -eq 0 && "${UPDATE_PLUMED_PATCH}" -eq 0 ]] || die "--offline is not used by PLUMED source-update routes; they reuse an existing or reconstructed source tree."
     [[ "${INSTALL_CUDA}" -eq 0 ]] \
       || die "Offline source cache does not provision a CUDA toolkit. Load/provide the site CUDA toolkit or use --cuda-runfile explicitly in a normal online run."
     if is_full_stack; then
@@ -1303,17 +1192,9 @@ validate_args() {
     *) die "Invalid accelerator '${ACCELERATOR}'. Use the default CUDA backend or pass --cpu-only." ;;
   esac
 
-  # -------------------------------------------------------------------------
-  # BOOKMARK: CPU-SAXS DEVELOPMENT/UPDATE SUPPORT IS INTENTIONALLY OUT OF SCOPE
-  # -------------------------------------------------------------------------
-  # The CPU profile is a lightweight analysis/login-node stack. It uses upstream
-  # PLUMED sources and must not silently enter the custom SAXS.cpp/ArrayFire
-  # development workflow. Revisit this block only after the custom SAXS.cpp has
-  # been separately compiled, scientifically validated, and regression-tested
-  # without ArrayFire/CUDA.
   if is_cpu_only; then
-    [[ "${UPDATE_SAXS}" -eq 0 ]] \
-      || die "--cpu-only --update-saxs is intentionally unsupported. CPU support for the custom SAXS-development/update workflow is kept out of scope pending separate validation."
+    [[ "${UPDATE_SAXS}" -eq 0 && "${UPDATE_PLUMED_PATCH}" -eq 0 ]] \
+      || die "PLUMED source-update routes are intentionally unsupported with --cpu-only."
     [[ "${INSTALL_CUDA}" -eq 0 ]] \
       || die "--install-cuda is incompatible with --cpu-only."
     [[ "${CUDA_PATH}" == "auto" ]] \
@@ -1333,7 +1214,21 @@ validate_args() {
         || die "--saxs-cpp is intentionally unsupported with --cpu-only; CPU PLUMED uses upstream SAXS sources only."
       [[ "${PLUMED_PATCH_DIR}" == "auto" ]] \
         || die "--plumed-patch-dir is intentionally unsupported with --cpu-only; CPU PLUMED uses upstream SAXS sources only."
+      [[ -z "${PLUMED_PATCH_BUNDLE}" ]] \
+        || die "--plumed-patch-bundle is intentionally unsupported with --cpu-only."
     fi
+  fi
+
+  if [[ "${UPDATE_PLUMED_PATCH}" -eq 1 ]]; then
+    [[ "${INSTALL_CUDA}" -eq 0 && "${INSTALL_CMAKE}" -eq 0 ]] || die "--update-plumed-patch reuses the existing installation toolchain; do not combine it with --install-cuda/--install-cmake."
+    [[ -n "${NAME}" ]] || die "--update-plumed-patch requires --name."
+    is_full_stack || die "--update-plumed-patch is only valid for a full PLUMED/GROMACS installation."
+    [[ -z "${FROM_STAGE}" && -z "${ONLY_STAGE}" ]] || die "--update-plumed-patch cannot be combined with --from or --only."
+    [[ "${WRITE_BASHRC}" -eq 0 && "${WRITE_ALIASES}" -eq 0 ]] || die "--update-plumed-patch does not modify shell activation aliases."
+    [[ "${DO_STATUS}" -eq 0 ]] || die "--update-plumed-patch and --status are separate operations."
+    [[ "${UPDATE_SAXS}" -eq 0 ]] || die "Use only one of --update-plumed-patch or --update-saxs."
+    [[ -z "${PLUMED_SAXS_CPP}" ]] || die "--saxs-cpp is not used with --update-plumed-patch; supply the manifest bundle instead."
+    [[ "${PLUMED_PATCH_DIR}" == "auto" ]] || die "--plumed-patch-dir is not used with --update-plumed-patch."
   fi
 
   if [[ "${UPDATE_SAXS}" -eq 1 ]]; then
@@ -1349,11 +1244,9 @@ validate_args() {
       || die "--update-saxs does not modify shell activation aliases; omit --write-bashrc/--write-aliases."
     [[ "${DO_STATUS}" -eq 0 ]] \
       || die "--update-saxs and --status are separate operations; run them independently."
-  else
-    [[ "${ALLOW_DIRTY_PLUMED}" -eq 0 ]] \
-      || die "--allow-dirty-plumed is only valid with --update-saxs."
-    [[ "${RUN_INSTALLCHECK}" -eq 0 ]] \
-      || die "--installcheck is only valid with --update-saxs."
+  elif [[ "${UPDATE_PLUMED_PATCH}" -eq 0 ]]; then
+    [[ "${ALLOW_DIRTY_PLUMED}" -eq 0 ]] || die "--allow-dirty-plumed is only valid with a PLUMED source-update route."
+    [[ "${RUN_INSTALLCHECK}" -eq 0 ]] || die "--installcheck is only valid with a PLUMED source-update route."
   fi
 
   if [[ -n "${FROM_STAGE}" ]] && ! is_valid_stage "${FROM_STAGE}"; then
@@ -1374,9 +1267,22 @@ validate_args() {
   if is_full_stack && [[ -n "${PLUMED_SAXS_CPP}" && ! -f "${PLUMED_SAXS_CPP}" ]]; then
     die "--saxs-cpp file not found: ${PLUMED_SAXS_CPP}"
   fi
+  if [[ -n "${PLUMED_PATCH_BUNDLE}" && ! -e "${PLUMED_PATCH_BUNDLE}" ]]; then
+    die "--plumed-patch-bundle path not found: ${PLUMED_PATCH_BUNDLE}"
+  fi
+  if [[ -n "${PLUMED_PATCH_BUNDLE}" ]]; then
+    [[ -z "${PLUMED_SAXS_CPP}" ]] || die "Use either --plumed-patch-bundle or --saxs-cpp, not both."
+    [[ "${PLUMED_PATCH_DIR}" == "auto" ]] || die "Use either --plumed-patch-bundle or --plumed-patch-dir, not both."
+  fi
   if is_gromacs_only; then
     [[ -n "${PLUMED_SAXS_CPP}" ]] && warn "--saxs-cpp is ignored in --gromacs-only mode."
+    [[ -n "${PLUMED_PATCH_BUNDLE}" ]] && warn "--plumed-patch-bundle is ignored in --gromacs-only mode."
     [[ "${PLUMED_PATCH_DIR}" != "auto" ]] && warn "--plumed-patch-dir is ignored in --gromacs-only mode."
+  fi
+  if is_full_stack && ! is_cpu_only && [[ -n "${PLUMED_PATCH_BUNDLE}" ]]; then
+    prepare_plumed_patch_bundle_input "${PLUMED_PATCH_BUNDLE}"
+    info "Validated PLUMED patch bundle: ${PLUMED_PATCH_FILE_COUNT} files, manifest ${PLUMED_PATCH_VALIDATED_MANIFEST_SHA256}."
+    cleanup_prepared_plumed_patch_bundle
   fi
 
   if [[ "${INSTALL_CUDA}" -eq 1 ]]; then
@@ -1408,8 +1314,7 @@ validate_args() {
 }
 
 cuda_bootstrap_catalog_runfile_url() {
-  # Deliberately curated. NVIDIA runfile filenames embed a driver build number,
-  # so unknown versions must be supplied explicitly instead of guessed.
+
   case "${1}" in
     12.6.3)
       printf '%s\n' 'https://developer.download.nvidia.com/compute/cuda/12.6.3/local_installers/cuda_12.6.3_560.35.05_linux.run'
@@ -1419,8 +1324,7 @@ cuda_bootstrap_catalog_runfile_url() {
 }
 
 cuda_bootstrap_default_version() {
-  # Conservative default with broad GPU support. CUDA 13 removes offline
-  # compilation/library support for pre-Turing GPUs such as Volta/V100.
+
   printf '%s\n' '12.6.3'
 }
 
@@ -1441,7 +1345,7 @@ detect_nvidia_driver_version() {
 }
 
 cuda_driver_minimum_for_toolkit() {
-  # NVIDIA Linux minor-version compatibility floors by toolkit major family.
+
   case "${1%%.*}" in
     11) printf '%s\n' '450.80.02' ;;
     12) printf '%s\n' '525.60.13' ;;
@@ -1741,8 +1645,6 @@ install_private_cuda() {
   tmp="$(mktemp -d "${TOOLCHAIN_DIR}/.cuda-install.XXXXXX")"
   mkdir -p "${CUDA_INSTALL_DIR}"
 
-  # No --driver is ever passed. --defaultroot and --no-man-page prevent the
-  # toolkit installer from needing system prefixes outside the user path.
   bash "${runfile}" \
     --silent \
     --toolkit \
@@ -1767,7 +1669,6 @@ install_private_cuda() {
   CUDA_PATH="${CUDA_INSTALL_DIR}"
 }
 
-
 check_work_dir() {
   [[ "${SPLIT_LAYOUT}" -eq 1 ]] || return 0
   local marker="${WORK_ROOT}/.installer_install_root" recorded=""
@@ -1791,19 +1692,15 @@ persist_workspace_profile() {
   printf '%s\n' "${SCRIPT_VERSION}" > "${WORK_ROOT}/.installer_version"
 }
 
-###############################################################################
-# CUDA detection
-###############################################################################
 get_cuda_version() {
-  # Prints "major.minor", e.g. 12.8
+
   local nvcc="${1}"
   "${nvcc}" --version 2>/dev/null \
     | grep -oE 'release [0-9]+\.[0-9]+' | head -n1 | awk '{print $2}'
 }
 
 _cuda_maybe_add_candidate() {
-  # _cuda_maybe_add_candidate <candidate-array-name> <path>
-  # Adds a CUDA root only when it has bin/nvcc and is not already present.
+
   local -n _arr="$1"
   local d="${2:-}" existing=""
   [[ -n "${d}" ]] || return 0
@@ -1817,9 +1714,7 @@ _cuda_maybe_add_candidate() {
 }
 
 _select_newest_cuda_candidate() {
-  # Prints the candidate with the highest nvcc major.minor version. Ties keep the
-  # earlier discovery order, so explicit/env/PATH candidates remain stable when
-  # two paths point to the same CUDA version.
+
   local candidates=("$@")
   local best="" best_major=-1 best_minor=-1
   local cand ver major minor
@@ -1841,10 +1736,7 @@ detect_cuda() {
   local cand=""
 
   if [[ -n "${CUDA_PATH}" && "${CUDA_PATH}" != "auto" ]]; then
-    # Explicit path: prefer the requested CUDA root when it has bin/nvcc.  On
-    # split Debian/Ubuntu CUDA installs, users may pass /usr/lib/cuda even
-    # though nvcc is /usr/bin/nvcc; with auto-repair enabled we accept that as a
-    # hint and consolidate the final layout into a private shim later.
+
     if [[ -x "${CUDA_PATH%/}/bin/nvcc" ]]; then
       cand="${CUDA_PATH%/}"
     elif [[ "${AUTO_REPAIR}" == "1" ]] && command -v nvcc >/dev/null 2>&1; then
@@ -1858,7 +1750,6 @@ detect_cuda() {
     local candidates=()
     shopt -s nullglob
 
-    # 1) Existing environment and PATH hints.
     _cuda_maybe_add_candidate candidates "${CUDA_HOME:-}"
     _cuda_maybe_add_candidate candidates "${CUDA_ROOT:-}"
     if command -v nvcc >/dev/null 2>&1; then
@@ -1866,9 +1757,6 @@ detect_cuda() {
       _cuda_maybe_add_candidate candidates "$(dirname "$(dirname "${nvcc_path}")")"
     fi
 
-    # 2) Fast common local/project locations. This intentionally avoids a full
-    # filesystem scan. The --dir parent is included before global locations so
-    # installs like /mnt/data/software/cuda are found without manual exports.
     for d in \
       "${DIR%/}/cuda" "${DIR%/}"/cuda-* \
       "${SCRIPT_DIR}/cuda" "${SCRIPT_DIR}"/cuda-* \
@@ -1881,9 +1769,6 @@ detect_cuda() {
       _cuda_maybe_add_candidate candidates "${d}"
     done
 
-    # 3) Shallow, bounded find only in a few likely roots. This catches layouts
-    # such as /mnt/data/software/cuda-12.5/bin/nvcc without touching the whole
-    # machine or deep scratch trees.
     for search_root in "${DIR:-}" /mnt/data/software /usr/local /opt "${HOME:-}/software"; do
       [[ -d "${search_root}" ]] || continue
       while IFS= read -r nvcc_path; do
@@ -1909,8 +1794,6 @@ detect_cuda() {
   [[ -n "${CUDA_VERSION}" ]] \
     || die "Found nvcc at ${CUDA_HOME}/bin/nvcc but could not parse its version."
 
-  # Export the CUDA environment internally so users do not have to pre-export
-  # CUDA_HOME/CUDA_ROOT/CUDACXX/PATH/LD_LIBRARY_PATH before invoking the script.
   export CUDA_HOME
   export CUDA_ROOT="${CUDA_HOME}"
   export CUDACXX="${CUDA_HOME}/bin/nvcc"
@@ -1918,9 +1801,6 @@ detect_cuda() {
   export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
 }
 
-###############################################################################
-# CUDA architecture resolution
-###############################################################################
 _normalize_cuda_arch_token() {
   local tok="$1"
   tok="${tok//[[:space:]]/}"
@@ -1942,7 +1822,7 @@ _detect_cuda_archs_nvidia_smi() {
   local caps=""
   caps="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null || true)"
   if [[ -z "${caps}" ]]; then
-    # Older nvidia-smi builds sometimes only accept paired fields.
+
     caps="$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader,nounits 2>/dev/null \
       | awk -F, '{print $NF}' || true)"
   fi
@@ -2014,9 +1894,6 @@ resolve_cuda_archs() {
   fi
 }
 
-###############################################################################
-# Path / name resolution
-###############################################################################
 resolve_paths() {
   DIR="$(abspath "${DIR}")"
   if [[ -z "${NAME}" ]]; then
@@ -2027,7 +1904,6 @@ resolve_paths() {
     fi
   fi
 
-  # Default parallel jobs to the core count (fall back to 1 if nproc is absent).
   if [[ -z "${NPROC}" ]]; then
     if command -v nproc >/dev/null 2>&1; then
       NPROC="$(nproc)"
@@ -2052,7 +1928,6 @@ resolve_paths() {
   LOG_DIR="${WORK_ROOT}/build_logs"
   CKPT_DIR="${WORK_ROOT}/.checkpoints"
 
-  # Activation alias must be a valid shell identifier; sanitize if needed.
   if [[ "${NAME}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
     ALIAS_NAME="${NAME}"
   else
@@ -2108,9 +1983,6 @@ load_persisted_install_profile() {
   configure_build_mode
 }
 
-###############################################################################
-# Checkpoints
-###############################################################################
 stage_done()      { [[ -f "${CKPT_DIR}/${1}.done" ]]; }
 mark_stage_done() { mkdir -p "${CKPT_DIR}"; date > "${CKPT_DIR}/${1}.done"; }
 
@@ -2132,9 +2004,6 @@ should_run() {
   return 0
 }
 
-###############################################################################
-# Pre-existing directory guard (requirement #3)
-###############################################################################
 check_install_dir() {
   local mode_marker="${INSTALL_ROOT}/.installer_build_mode"
   local accel_marker="${INSTALL_ROOT}/.installer_accelerator"
@@ -2159,7 +2028,7 @@ Use a new --name, or pass --force to replace/rebuild the selected route."
 Backend changes are not allowed in-place, even with --force; use a new --name to prevent stale CPU/GPU artifacts from mixing."
     fi
   elif [[ -d "${CKPT_DIR}" ]] && is_cpu_only; then
-    # v32.1 and older installs had no accelerator marker and were CUDA builds.
+
     die "Existing checkpointed install has no accelerator marker and is conservatively assumed to be a legacy CUDA build. Use a new --name for --cpu-only; backend conversion in-place is intentionally refused."
   fi
 
@@ -2178,12 +2047,12 @@ or -y/--yes (reuse and keep checkpoints) to install into it anyway."
 }
 
 version_ge() {
-  # version_ge A B  -> true if A >= B
+
   [[ "$(printf '%s\n%s\n' "${2}" "${1}" | sort -V | head -n1)" == "${2}" ]]
 }
 
 path_list_to_array() {
-  # path_list_to_array <colon-separated-string>
+
   local list="${1:-}" item
   [[ -n "${list}" ]] || return 0
   IFS=':' read -r -a _path_items <<< "${list}"
@@ -2194,7 +2063,7 @@ path_list_to_array() {
 }
 
 first_existing_file() {
-  # first_existing_file <name> <dir1> [dir2 ...]
+
   local name="${1}" d
   shift
   for d in "$@"; do
@@ -2205,7 +2074,7 @@ first_existing_file() {
 }
 
 first_existing_library() {
-  # first_existing_library <libname-or-glob> <dir1> [dir2 ...]
+
   local pat="${1}" d f
   shift
   shopt -s nullglob
@@ -2272,9 +2141,7 @@ cuda_lib_ok() {
 }
 
 needs_cuda_shim() {
-  # Normal NVIDIA toolkit layouts should pass without any shim.  Split distro
-  # layouts, e.g. /usr/bin/nvcc + /usr/include + /usr/lib/x86_64-linux-gnu,
-  # generally need a private consolidated prefix.
+
   [[ "${AUTO_REPAIR}" == "1" ]] || return 1
   [[ ! -x "${CUDA_HOME}/bin/nvcc" ]] && return 0
   [[ "${CUDA_HOME}" == "/usr" || "${CUDA_HOME}" == "/" ]] && return 0
@@ -2288,10 +2155,7 @@ link_cuda_headers_into_shim() {
   mkdir -p "${shim}/include"
   while IFS= read -r d; do
     [[ -d "${d}" ]] || continue
-    # Link broad CUDA-ish top-level headers. This is intentionally broader than
-    # the exact headers we already hit (cuComplex.h, cuda_fp16.h,
-    # math_constants.h), because ArrayFire/NVRTC generates a bundle from many
-    # CUDA headers and future versions may require more.
+
     shopt -s nullglob
     for f in "${d}"/*.h "${d}"/*.hpp; do
       base="$(basename "${f}")"
@@ -2307,7 +2171,6 @@ link_cuda_headers_into_shim() {
     done
   done < <(cuda_candidate_include_dirs | unique_lines)
 
-  # nvml.h is sometimes nested (e.g. /usr/include/nvidia/gdk/nvml.h).
   if [[ ! -f "${shim}/include/nvml.h" ]]; then
     nvml="$(find /usr /usr/local -path '*/nvml.h' -type f 2>/dev/null | head -n1 || true)"
     [[ -n "${nvml}" ]] && ln -sfn "${nvml}" "${shim}/include/nvml.h"
@@ -2325,7 +2188,7 @@ link_cuda_libs_into_shim() {
       [[ -e "${f}" ]] || continue
       base="$(basename "${f}")"
       ln -sfn "${f}" "${shim}/lib64/${base}"
-      # Also provide an unversioned .so if only a versioned SONAME was present.
+
       if [[ "${base}" =~ ^(lib[^.]+)\.so\. ]]; then
         stem="${BASH_REMATCH[1]}.so"
         [[ -e "${shim}/lib64/${stem}" ]] || ln -sfn "${base}" "${shim}/lib64/${stem}"
@@ -2334,7 +2197,6 @@ link_cuda_libs_into_shim() {
     shopt -u nullglob
   done < <(cuda_candidate_lib_dirs | unique_lines)
 
-  # GROMACS' NVML discovery often asks specifically for lib64/stubs/libnvidia-ml.so.
   if [[ ! -e "${shim}/lib64/stubs/libnvidia-ml.so" && -e "${shim}/lib64/libnvidia-ml.so" ]]; then
     ln -sfn "../libnvidia-ml.so" "${shim}/lib64/stubs/libnvidia-ml.so"
   fi
@@ -2396,9 +2258,7 @@ ensure_cuda_development_layout() {
 }
 
 probe_private_openmpi_libnsl() {
-  # Advisory only. Some OpenMPI configurations discover/use libnsl, and on
-  # stripped HPC compute images the runtime lib may exist without the linker
-  # development symlink. Do not make this a portability requirement.
+
   is_full_stack && is_cuda_backend && ! using_system_mpi || return 0
   [[ -x "${BUILD_CC:-}" ]] || return 0
   local tmp src exe
@@ -2621,7 +2481,7 @@ setup_environment() {
   unset PKG_CONFIG_LIBDIR 2>/dev/null || true
 
   if is_cpu_only; then
-    # Do not export CUDA toolchain variables into CPU build subprocesses.
+
     CUDA_HOME=""
     CUDA_VERSION="not-used"
     export -n CUDA_HOME 2>/dev/null || true
@@ -2718,9 +2578,6 @@ assert_no_missing_libs() {
   rm -f "${tmp}"
 }
 
-###############################################################################
-# Build stages
-###############################################################################
 mpi_wrapper_matches_compiler() {
   local wrapper="${1}" expected="${2}" expected_real command_line tok tok_real
   expected_real="$(canonical_executable "${expected}" || true)"
@@ -2735,10 +2592,7 @@ mpi_wrapper_matches_compiler() {
 }
 
 validate_openmpi_compiler_provenance() {
-  # strict: used immediately after building OpenMPI; wrappers must match the
-  # selected toolchain. reuse: used by a resumed GROMACS stage. If the caller
-  # did not explicitly request CC/CXX, report and trust the already-installed
-  # wrapper toolchain instead of comparing it with an unrelated shell default.
+
   local mode="${1:-reuse}" cc_cmd cxx_cmd
   cc_cmd="$("${MPI_ROOT}/bin/mpicc" --showme:command 2>/dev/null || true)"
   cxx_cmd="$("${MPI_ROOT}/bin/mpicxx" --showme:command 2>/dev/null || true)"
@@ -2996,13 +2850,6 @@ stage_arrayfire() {
     patch_arrayfire_offline_fetchcontent "${SRC}/arrayfire-${ARRAYFIRE_VERSION}"
   fi
 
-  # Compatibility patch for ArrayFire 3.9.0 math.hpp across both normal
-  # host compilation and NVRTC runtime JIT compilation.  Some newer host
-  # compiler/libstdc++ combinations need std::isnan, while NVRTC does not
-  # provide std::isnan in the runtime-compiled CUDA header path.  Use a tiny
-  # wrapper macro: std::isnan for normal C++ compilation, global isnan for
-  # NVRTC (__CUDACC_RTC__).  This avoids the runtime PLUMED/SAXS failure:
-  #   NVRTC_ERROR_COMPILATION: namespace "std" has no member "isnan".
   local af_cuda_math="src/backend/cuda/math.hpp"
   if [[ -f "${af_cuda_math}" ]]; then
     if grep -Eq '(^|[^A-Za-z0-9_])(::|std::)?isnan[[:space:]]*\(' "${af_cuda_math}"; then
@@ -3025,8 +2872,6 @@ macro = """#ifndef AF_CUDA_MATH_ISNAN
 """
 
 if 'AF_CUDA_MATH_ISNAN' not in text:
-    # Put the macro after the last leading #include block.  This keeps it near
-    # the math declarations while avoiding assumptions about exact line numbers.
     lines = text.splitlines(True)
     insert_at = 0
     for i, line in enumerate(lines):
@@ -3035,12 +2880,8 @@ if 'AF_CUDA_MATH_ISNAN' not in text:
     lines.insert(insert_at, '\n' + macro + '\n')
     text = ''.join(lines)
 
-# Replace only namespace-qualified/global isnan calls, not the helper/macro name.
-# The original ArrayFire source uses ::isnan; earlier installer versions changed
-# that to std::isnan.  Both variants are normalized here.
 text = re.sub(r'(?<![A-Za-z0-9_])(?:std::|::)?isnan\s*\(', 'AF_CUDA_MATH_ISNAN(', text)
 
-# The replacement above must not rewrite the macro body itself.
 text = text.replace('#    define AF_CUDA_MATH_ISNAN(x) AF_CUDA_MATH_ISNAN(x)', '#    define AF_CUDA_MATH_ISNAN(x) isnan(x)')
 text = text.replace('#    define AF_CUDA_MATH_ISNAN(x) std::AF_CUDA_MATH_ISNAN(x)', '#    define AF_CUDA_MATH_ISNAN(x) std::isnan(x)')
 
@@ -3049,11 +2890,6 @@ PYEOF
     fi
   fi
 
-  # CUDA 13 moved Thrust/CCCL headers under include/cccl and no longer exposes
-  # some old internal Thrust headers used by ArrayFire 3.9.0. ArrayFire only
-  # needs the public CUDA execution-policy header here, so replace the removed
-  # internal include with the public one. This is intentionally narrow and is
-  # applied only when the source contains the legacy include.
   local af_thrust_utils="src/backend/cuda/thrust_utils.hpp"
   if [[ -f "${af_thrust_utils}" ]]; then
     if grep -q 'thrust/system/cuda/detail/par.h' "${af_thrust_utils}"; then
@@ -3062,12 +2898,6 @@ PYEOF
     fi
   fi
 
-  # CUDA 13/CCCL removed the legacy internal header
-  # <thrust/system/cuda/detail/par.h>. ArrayFire 3.9.0 uses it in more than
-  # one CUDA backend file, so patch any remaining occurrences after the
-  # dedicated thrust_utils.hpp compatibility edit above. The replacement is the
-  # public execution policy header, which is the same replacement already proven
-  # for thrust_utils.hpp on this CUDA 13 build.
   local af_legacy_thrust_files
   af_legacy_thrust_files="$(grep -RIl 'thrust/system/cuda/detail/par.h' src/backend/cuda 2>/dev/null || true)"
   if [[ -n "${af_legacy_thrust_files}" ]]; then
@@ -3079,10 +2909,6 @@ PYEOF
     done <<< "${af_legacy_thrust_files}"
   fi
 
-  # CUDA 13/CCCL removed/changed visibility of a few legacy Thrust adapter
-  # APIs used by ArrayFire 3.9.0.  The inheritance from thrust::unary_function
-  # is only a deprecated typedef-style adapter and is not needed for the functor
-  # itself, while thrust::distance simply needs its public header.
   local af_regions_hpp="src/backend/cuda/kernel/regions.hpp"
   if [[ -f "${af_regions_hpp}" ]]; then
     if grep -q 'thrust::unary_function' "${af_regions_hpp}"; then
@@ -3128,11 +2954,6 @@ PYEOF
     fi
   fi
 
-  # CUDA 13 removed the legacy cudaDeviceProp::clockRate field from
-  # cudaDeviceProp. ArrayFire 3.9.0 only uses it to estimate a device GFLOP/s
-  # score for sorting CUDA devices. Query the same value via the public runtime
-  # attribute API on CUDA 13+, while preserving the old field path for older
-  # toolkits.
   local af_device_manager_cpp="src/backend/cuda/device_manager.cpp"
   if [[ -f "${af_device_manager_cpp}" ]]; then
     if grep -q 'dev\.prop\.clockRate' "${af_device_manager_cpp}"; then
@@ -3176,14 +2997,6 @@ PYEOF
     fi
   fi
 
-  # Note: v22 had an optional CUDA 13/Blackwell runtime-table patch here.
-  # It was removed in v23 because ArrayFire 3.9.0 source variants differ in
-  # table names. The confirmed required CUDA 13 fix is the clock-rate patch above.
-
-  # CUDA 13/CCCL no longer makes thrust::pair visible through the headers that
-  # ArrayFire 3.9.0 includes indirectly. The type is still available when the
-  # public <thrust/pair.h> header is included. Keep ArrayFire's code unchanged
-  # and add the missing public include to its custom Thrust policy header.
   local af_thrust_policy="src/backend/cuda/ThrustArrayFirePolicy.hpp"
   if [[ -f "${af_thrust_policy}" ]]; then
     if grep -q 'thrust::pair' "${af_thrust_policy}" \
@@ -3193,11 +3006,6 @@ PYEOF
     fi
   fi
 
-  # CUDA 13 removes/does not expose a few legacy cuFFT result enum values
-  # that ArrayFire 3.9.0 still lists in its error-string switch. These values
-  # are only used for human-readable diagnostics.  Patch the whole diagnostic
-  # function rather than deleting individual case labels: this preserves the
-  # surrounding source structure and avoids brittle sed range mistakes.
   local af_cufft="src/backend/cuda/cufft.cu"
   if [[ -f "${af_cufft}" ]]; then
     if grep -Eq 'CUFFT_INCOMPLETE_PARAMETER_LIST|CUFFT_PARSE_ERROR|CUFFT_LICENSE_ERROR' "${af_cufft}"; then
@@ -3332,16 +3140,10 @@ PYEOF
   mark_stage_done arrayfire
 }
 
-
-# PLUMED's python interface build runs "python3 -m build". Some HPC Python
-# installations lack the Debian/Ubuntu python3-venv/ensurepip package, so a
-# normal "python3 -m venv" may fail without root privileges. Prefer a local
-# --target installation using pip when available, and fall back to venv only
-# if the system Python supports it. Nothing is installed system-wide.
 ensure_python_build_module() {
   if command -v python3 >/dev/null 2>&1 \
      && python3 - <<'PYEOF' >/dev/null 2>&1
-import build.__main__  # noqa: F401
+import build.__main__
 PYEOF
   then
     ok "python3 can already run 'python3 -m build'."
@@ -3356,7 +3158,7 @@ PYEOF
 
   _try_import_build() {
     python3 - <<'PYEOF' >/dev/null 2>&1
-import build.__main__  # noqa: F401
+import build.__main__
 PYEOF
   }
 
@@ -3373,11 +3175,11 @@ PYEOF
   }
 
   _try_install_build_with_cmd() {
-    # $1 is a shell command string, e.g. "python3 -m pip" or "/path/pip3".
+
     local cmd="$1"
     rm -rf "${pybuild_target}"
     mkdir -p "${pybuild_target}"
-    # PIP_BREAK_SYSTEM_PACKAGES avoids Debian/Ubuntu PEP668 blocking local installs.
+
     if PIP_BREAK_SYSTEM_PACKAGES=1 ${cmd} install --upgrade \
          --target "${pybuild_target}" --no-warn-script-location \
          build setuptools wheel; then
@@ -3401,9 +3203,6 @@ PYEOF
     warn "No python3 -m pip or pip3 found; bootstrapping a private pip without root."
   fi
 
-  # Rootless pip bootstrap for minimal Debian/Ubuntu Python installs that lack
-  # python3-pip and python3-venv. This requires outbound HTTPS, which the build
-  # already needs for source downloads.
   rm -rf "${pybuild_prefix}"
   mkdir -p "${pybuild_prefix}" "${SRC}"
   getpip="${SRC}/get-pip.py"
@@ -3417,8 +3216,6 @@ PYEOF
     fi
   fi
 
-  # Install private pip under pybuild_pip. On this HPC, the prefix install puts
-  # packages under .../local/lib/pythonX.Y/dist-packages, not always site-packages.
   if ! python3 "${getpip}" --prefix "${pybuild_prefix}" --no-warn-script-location pip setuptools wheel; then
     warn "get-pip prefix install failed; retrying with --break-system-packages."
     python3 "${getpip}" --prefix "${pybuild_prefix}" --break-system-packages \
@@ -3445,14 +3242,13 @@ PYEOF
     _try_install_build_with_cmd "${pip_exe}" && return 0
   fi
 
-  # Last fallback: try venv if the system has ensurepip after all.
   local pybuild_env="${INSTALL_ROOT}/pybuild"
   rm -rf "${pybuild_env}"
   if python3 -m venv "${pybuild_env}" >/dev/null 2>&1; then
     "${pybuild_env}/bin/python" -m pip install --upgrade pip setuptools wheel build \
       || die "Could not install Python build tooling into ${pybuild_env}."
     "${pybuild_env}/bin/python" - <<'PYEOF'
-import build.__main__  # noqa: F401
+import build.__main__
 PYEOF
     export PATH="${pybuild_env}/bin:${PATH}"
     ok "Using private Python build environment: ${pybuild_env}"
@@ -3462,25 +3258,16 @@ PYEOF
   die "Could not provide the Python 'build' module without root privileges. Manual fallback: install a user Python with pip, then rerun from the plumed stage."
 }
 
-
-# v31: retained-install Python handling for --update-saxs.
-# A retained PLUMED tree may have Python support enabled even though fresh v30+
-# builds default to --disable-python. The update route must preserve that
-# capability without reconfiguring PLUMED and without modifying system/Conda
-# Python installations. In particular, do not trust the historical
-# plumed_found_python_build=yes flag: PLUMED 2.11's configure probe only tests
-# `import build`, while the build step actually needs `python -m build`.
 saxs_update_python_can_build() {
   local py="${1}"
   "${py}" - <<'PYEOF' >/dev/null 2>&1
-import build.__main__  # noqa: F401
+import build.__main__
 PYEOF
   "${py}" -m build --version >/dev/null 2>&1
 }
 
 saxs_update_python_details() {
-  # saxs_update_python_details <python-executable>
-  # Prints two lines: origin and distribution/version. Never fails the update.
+
   local py="${1}"
   "${py}" - <<'PYEOF' 2>/dev/null || true
 import importlib.metadata
@@ -3505,7 +3292,7 @@ PYEOF
 }
 
 inspect_saxs_update_python() {
-  # Read only the retained PLUMED configuration. No configure step is run.
+
   local plumed_src="${1}" config makeconf configured="" resolved="" details=""
   config="${plumed_src}/src/config/config.txt"
   makeconf="${plumed_src}/Makefile.conf"
@@ -3546,8 +3333,7 @@ inspect_saxs_update_python() {
   fi
   SAXS_UPDATE_PYTHON_RESOLVED="${resolved}"
 
-  # PLUMED's extension build needs Python headers for the same interpreter.
-  "${resolved}" - <<'PYEOF' >/dev/null 2>&1 || die "Python headers are missing for retained PLUMED python_bin: ${resolved}. Provide the matching Python development headers/environment; v31 will not disable retained Python support."
+  "${resolved}" - <<'PYEOF' >/dev/null 2>&1 || die "Python headers are missing for retained PLUMED python_bin: ${resolved}. Provide the matching Python development headers/environment; retained Python support will not be disabled automatically."
 import pathlib, sysconfig
 inc = pathlib.Path(sysconfig.get_paths().get("include", "")) / "Python.h"
 raise SystemExit(0 if inc.is_file() else 1)
@@ -3632,12 +3418,206 @@ ensure_saxs_update_python_build_module() {
   info "Python build package: origin='${SAXS_UPDATE_PYTHON_BUILD_ORIGIN:-unknown}', version='${SAXS_UPDATE_PYTHON_BUILD_VERSION:-unknown}'"
 }
 
+plumed_patch_canonical_dir() {
+  printf '%s\n' "${INSTALL_ROOT}/plumed_patch_bundle/current"
+}
+
+prepare_plumed_patch_bundle_input() {
+  local input="${1}" tmp_root="" resolved=""
+  input="$(abspath "${input}")"
+  if [[ -d "${input}" ]]; then
+    if [[ -f "${input}/PATCHFILES.sha256" && -d "${input}/plumed2" ]]; then
+      resolved="${input}"
+    else
+      resolved="$(python3 - "${input}" <<'PYD'
+import os,sys
+root=os.path.abspath(sys.argv[1]); found=[]
+for base,dirs,files in os.walk(root):
+    depth=os.path.relpath(base,root).count(os.sep)
+    if depth>1:
+        dirs[:]=[]
+        continue
+    if 'PATCHFILES.sha256' in files and os.path.isdir(os.path.join(base,'plumed2')):
+        found.append(base)
+if len(found)!=1:
+    raise SystemExit(f'expected exactly one patch root, found {len(found)}')
+print(found[0])
+PYD
+)" || die "Patch directory must contain exactly one PATCHFILES.sha256 + plumed2 payload root: ${input}"
+    fi
+  elif [[ -f "${input}" ]]; then
+    tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/plumed-patch.XXXXXX")"
+    resolved="$(python3 - "${input}" "${tmp_root}" <<'PYI'
+import os,sys,tarfile
+archive,out=sys.argv[1:]
+with tarfile.open(archive,'r:*') as t:
+    for m in t.getmembers():
+        n=m.name.replace('\\','/')
+        if n.startswith('/') or any(x=='..' for x in n.split('/')):
+            raise SystemExit('unsafe archive path: '+m.name)
+        if m.issym() or m.islnk() or not (m.isfile() or m.isdir()):
+            raise SystemExit('unsupported archive member: '+m.name)
+    try:
+        t.extractall(out,filter='fully_trusted')
+    except TypeError:
+        t.extractall(out)
+roots=[]
+for root,dirs,files in os.walk(out):
+    if 'PATCHFILES.sha256' in files and os.path.isdir(os.path.join(root,'plumed2')):
+        roots.append(root)
+if len(roots)!=1:
+    raise SystemExit(f'expected exactly one patch root, found {len(roots)}')
+print(roots[0])
+PYI
+)" || { rm -rf -- "${tmp_root}"; die "Could not safely extract PLUMED patch bundle: ${input}"; }
+  else
+    die "PLUMED patch bundle not found: ${input}"
+  fi
+  validate_plumed_patch_bundle_root "${resolved}"
+  PLUMED_PATCH_PREPARED_ROOT="${resolved}"
+  PLUMED_PATCH_PREPARED_TMP="${tmp_root}"
+}
+
+validate_plumed_patch_bundle_root() {
+  local root="${1}" result
+  result="$(python3 - "${root}" <<'PYV'
+import hashlib,os,re,sys
+from pathlib import Path
+root=Path(sys.argv[1]).resolve()
+manifest=root/'PATCHFILES.sha256'
+payload=root/'plumed2'
+if not manifest.is_file() or not payload.is_dir(): raise SystemExit('missing PATCHFILES.sha256 or plumed2')
+entries=[]; seen=set()
+for i,line in enumerate(manifest.read_text().splitlines(),1):
+    m=re.fullmatch(r'([0-9a-fA-F]{64})  (plumed2/.+)',line)
+    if not m: raise SystemExit(f'malformed manifest line {i}')
+    h=m.group(1).lower(); rel=m.group(2).replace('\\','/')
+    parts=rel.split('/')
+    if rel.startswith('/') or any(x in ('','.','..') for x in parts): raise SystemExit(f'unsafe manifest path: {rel}')
+    if any(c.isspace() for c in rel): raise SystemExit(f'whitespace not allowed in manifest path: {rel}')
+    target=parts[1:]
+    if '.git' in target: raise SystemExit(f'git metadata path not allowed: {rel}')
+    if target and target[0].startswith('-'): raise SystemExit(f'unsafe target path: {rel}')
+    if rel in seen: raise SystemExit(f'duplicate manifest path: {rel}')
+    seen.add(rel); entries.append((h,rel))
+actual=[]
+for base,dirs,files in os.walk(payload,followlinks=False):
+    for d in dirs:
+        p=Path(base)/d
+        if p.is_symlink(): raise SystemExit(f'symlink not allowed: {p.relative_to(root)}')
+    for f in files:
+        p=Path(base)/f
+        if p.is_symlink() or not p.is_file(): raise SystemExit(f'non-regular payload: {p.relative_to(root)}')
+        actual.append(p.relative_to(root).as_posix())
+if set(actual)!=seen:
+    missing=sorted(seen-set(actual)); extra=sorted(set(actual)-seen)
+    raise SystemExit('payload/manifest mismatch; missing='+','.join(missing)+' extra='+','.join(extra))
+for h,rel in entries:
+    p=root/rel
+    got=hashlib.sha256(p.read_bytes()).hexdigest()
+    if got!=h: raise SystemExit(f'hash mismatch: {rel}')
+manifest_hash=hashlib.sha256(manifest.read_bytes()).hexdigest()
+print(f'{len(entries)} {manifest_hash}')
+PYV
+)" || die "PLUMED patch bundle validation failed: ${root}"
+  PLUMED_PATCH_FILE_COUNT="${result%% *}"
+  PLUMED_PATCH_VALIDATED_MANIFEST_SHA256="${result#* }"
+  [[ "${PLUMED_PATCH_FILE_COUNT}" =~ ^[1-9][0-9]*$ ]] || die "PLUMED patch manifest is empty."
+}
+
+
+cleanup_prepared_plumed_patch_bundle() {
+  [[ -z "${PLUMED_PATCH_PREPARED_TMP:-}" ]] || rm -rf -- "${PLUMED_PATCH_PREPARED_TMP}"
+  PLUMED_PATCH_PREPARED_TMP=""
+}
+
+copy_plumed_patch_bundle_atomic() {
+  local source_root="${1}" canonical tmp
+  canonical="$(plumed_patch_canonical_dir)"
+  tmp="${canonical}.tmp.$$"
+  rm -rf -- "${tmp}"
+  mkdir -p "${tmp}/plumed2"
+  cp -p -- "${source_root}/PATCHFILES.sha256" "${tmp}/PATCHFILES.sha256"
+  cp -a -- "${source_root}/plumed2/." "${tmp}/plumed2/"
+  validate_plumed_patch_bundle_root "${tmp}"
+  rm -rf -- "${canonical}.previous.$$"
+  if [[ -e "${canonical}" ]]; then mv -- "${canonical}" "${canonical}.previous.$$"; fi
+  if mv -- "${tmp}" "${canonical}"; then
+    rm -rf -- "${canonical}.previous.$$"
+  else
+    rm -rf -- "${tmp}"
+    [[ ! -e "${canonical}.previous.$$" ]] || mv -- "${canonical}.previous.$$" "${canonical}"
+    die "Could not activate canonical PLUMED patch bundle."
+  fi
+  validate_plumed_patch_bundle_root "${canonical}"
+  LAST_PLUMED_PATCH_BUNDLE="${canonical}"
+  LAST_PLUMED_PATCH_MANIFEST_SHA256="${PLUMED_PATCH_VALIDATED_MANIFEST_SHA256}"
+}
+
+plumed_patch_target_list() {
+  local root="${1}"
+  awk '{p=$2; sub(/^plumed2\//,"",p); print p}' "${root}/PATCHFILES.sha256"
+}
+
+apply_plumed_patch_bundle_root_to_tree() {
+  local root="${1}" plumed_src="${2}" result
+  validate_plumed_patch_bundle_root "${root}"
+  result="$(python3 - "${root}" "${plumed_src}" <<'PYA'
+import hashlib,os,shutil,sys
+from pathlib import Path
+root=Path(sys.argv[1]).resolve(); tree=Path(sys.argv[2]).resolve()
+if not tree.is_dir(): raise SystemExit('PLUMED source tree missing')
+entries=[]
+for line in (root/'PATCHFILES.sha256').read_text().splitlines():
+    h,rel=line.split('  ',1); entries.append((h.lower(),rel))
+for h,rel in entries:
+    target_rel=Path(rel[len('plumed2/'):])
+    cur=tree
+    for part in target_rel.parts[:-1]:
+        cur=cur/part
+        if cur.exists() and cur.is_symlink(): raise SystemExit(f'symlinked destination parent: {target_rel}')
+    dst=tree/target_rel
+    dst.parent.mkdir(parents=True,exist_ok=True)
+    if dst.exists() and (dst.is_symlink() or not dst.is_file()): raise SystemExit(f'unsafe destination: {target_rel}')
+    src=root/rel
+    shutil.copy2(src,dst)
+    os.utime(dst,None)
+    got=hashlib.sha256(dst.read_bytes()).hexdigest()
+    if got!=h: raise SystemExit(f'destination hash mismatch: {target_rel}')
+print(len(entries))
+PYA
+)" || die "Could not apply PLUMED patch payload safely."
+  [[ "${result}" == "${PLUMED_PATCH_FILE_COUNT}" ]] || die "PLUMED patch application count mismatch."
+  ok "PLUMED patch payload applied and verified (${result} files, manifest ${PLUMED_PATCH_VALIDATED_MANIFEST_SHA256})."
+}
+
+
+plumed_patch_tree_matches() {
+  local root="${1}" plumed_src="${2}" expected rel dst
+  while read -r expected rel; do
+    [[ -n "${expected}" && -n "${rel}" ]] || continue
+    rel="${rel#plumed2/}"
+    dst="${plumed_src}/${rel}"
+    [[ -f "${dst}" && "$(sha256_file "${dst}")" == "${expected}" ]] || return 1
+  done < "${root}/PATCHFILES.sha256"
+  return 0
+}
+
+persist_and_apply_plumed_patch_bundle() {
+  local input="${1}" plumed_src="${2}" canonical
+  prepare_plumed_patch_bundle_input "${input}"
+  copy_plumed_patch_bundle_atomic "${PLUMED_PATCH_PREPARED_ROOT}"
+  cleanup_prepared_plumed_patch_bundle
+  canonical="$(plumed_patch_canonical_dir)"
+  apply_plumed_patch_bundle_root_to_tree "${canonical}" "${plumed_src}"
+  if [[ -f "${canonical}/plumed2/src/isdb/SAXS.cpp" ]]; then
+    LAST_SAXS_CANDIDATE="${canonical}/plumed2/src/isdb/SAXS.cpp"
+  fi
+}
 
 resolve_plumed_patch_dir() {
   if [[ "${PLUMED_PATCH_DIR}" == "auto" || -z "${PLUMED_PATCH_DIR}" ]]; then
-    # The install-owned folder is canonical after an environment has been
-    # created. A patch shipped beside the installer seeds a genuinely fresh
-    # installation only when no install-owned candidate exists yet.
+
     local script_patch install_patch
     script_patch="${SCRIPT_DIR}/plumed_patch"
     install_patch="${INSTALL_ROOT}/plumed_patch"
@@ -3656,8 +3636,7 @@ resolve_plumed_patch_dir() {
 }
 
 select_saxs_candidate_from_dir() {
-  # select_saxs_candidate_from_dir <patch-dir>
-  # Refuse ambiguous direct/nested candidates unless their bytes are identical.
+
   local patch_dir="${1}" direct nested
   direct="${patch_dir}/SAXS.cpp"
   nested="${patch_dir}/src/isdb/SAXS.cpp"
@@ -3673,10 +3652,12 @@ select_saxs_candidate_from_dir() {
 }
 
 apply_plumed_local_patches() {
-  # apply_plumed_local_patches <plumed-source-tree>
-  # Currently supports a development override for src/isdb/SAXS.cpp.
   local plumed_src="${1}"
   local patch_dir candidate target backup_dir canonical timestamp
+  if [[ -n "${PLUMED_PATCH_BUNDLE}" ]]; then
+    persist_and_apply_plumed_patch_bundle "${PLUMED_PATCH_BUNDLE}" "${plumed_src}"
+    return 0
+  fi
 
   patch_dir="$(resolve_plumed_patch_dir)"
   target="${plumed_src}/src/isdb/SAXS.cpp"
@@ -3697,8 +3678,6 @@ apply_plumed_local_patches() {
     cp -- "${target}" "${backup_dir}/SAXS.cpp.upstream"
     cp -- "${candidate}" "${backup_dir}/SAXS.cpp.candidate"
 
-    # Seed/update the canonical install-owned development candidate so later
-    # --update-saxs runs never depend on the installer's current directory.
     canonical="${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
     mkdir -p "$(dirname "${canonical}")"
     if [[ "$(abspath "${candidate}")" != "$(abspath "${canonical}")" ]]; then
@@ -3767,12 +3746,6 @@ stage_plumed_cpu() {
   info "PLUMED commit: $(git rev-parse HEAD)"
   make distclean 2>/dev/null || true
 
-  # -------------------------------------------------------------------------
-  # BOOKMARK: CUSTOM SAXS.cpp CPU SUPPORT IS INTENTIONALLY NOT IMPLEMENTED.
-  # -------------------------------------------------------------------------
-  # Do NOT call apply_plumed_local_patches here. This lightweight CPU profile
-  # always builds the upstream PLUMED SAXS source and deliberately excludes the
-  # custom SAXS-development/update workflow until it has separate CPU validation.
   info "CPU PLUMED profile: local/custom SAXS.cpp overrides are intentionally disabled; using upstream PLUMED sources."
 
   local plumed_cppflags="-I${FFTW_ROOT}/include"
@@ -3823,9 +3796,7 @@ stage_plumed_cpu() {
 }
 
 configure_plumed_cuda_tree() {
-  # configure_plumed_cuda_tree <configured-source-dir>
-  # Shared by the normal PLUMED build and v35 workspace reconstruction. This
-  # function configures only; callers decide whether to compile/install.
+
   local plumed_src="${1}"
   [[ -d "${plumed_src}" ]] || die "PLUMED source directory not found: ${plumed_src}"
 
@@ -3847,9 +3818,6 @@ configure_plumed_cuda_tree() {
     ensure_python_build_module
   fi
 
-  # PLUMED's configure check for ArrayFire is easy to miss: without explicit
-  # LIBS it may find arrayfire.h but fail the af_is_double link test and then
-  # silently continue without __PLUMED_HAS_ARRAYFIRE.
   local af_libdir="${AF_ROOT}/lib"
   [[ -d "${af_libdir}" ]] || af_libdir="${AF_ROOT}/lib64"
   [[ -d "${af_libdir}" ]] || die "ArrayFire library directory not found under ${AF_ROOT}"
@@ -3973,17 +3941,16 @@ stage_plumed() {
   configure_plumed_cuda_tree "${plumed_src}"
 
   cd "${plumed_src}"
-  # Do not let PLUMED runtime environment variables leak into the build-tree
-  # executable used for generated files such as json/syntax.json.
+
   env -u PLUMED_ROOT -u PLUMED_INSTALL_PREFIX -u PLUMED_KERNEL -u PLUMED_PREFIX make -j"${NPROC}"
+  if [[ -f "$(plumed_patch_canonical_dir)/PATCHFILES.sha256" ]]; then
+    plumed_patch_tree_matches "$(plumed_patch_canonical_dir)" "${plumed_src}" || die "PLUMED patch targets changed during the build."
+  fi
   env -u PLUMED_ROOT -u PLUMED_INSTALL_PREFIX -u PLUMED_KERNEL -u PLUMED_PREFIX make install
   ok "PLUMED installed at ${PLUMED_ROOT}"
   mark_stage_done plumed
 }
 
-###############################################################################
-# Incremental SAXS-only update and persistent installation reporting (v31)
-###############################################################################
 plumed_build_kernel_path() {
   local plumed_src="${1}" candidate
   for candidate in \
@@ -4065,7 +4032,7 @@ detect_gromacs_plumed_linkage() {
 }
 
 installed_component_version() {
-  # installed_component_version <component>
+
   local component="${1}" value=""
   case "${component}" in
     cuda)
@@ -4118,12 +4085,13 @@ installed_component_version() {
 }
 
 write_installation_reports() {
-  # write_installation_reports <last-action>
+
   local action="${1}" report manifest report_tmp manifest_tmp timestamp host
   local has_plumed=0 plumed_prefix="" plumed_src="" commit saxs_hash kernel_hash candidate_hash linkage
   local cuda_v mpi_v fftw_v boost_v fmt_v spdlog_v af_v plumed_v gmx_v
   local plumed_dirty plumed_diff_hash plumed_untracked mpi_cc_cmd mpi_cxx_cmd cc_v cxx_v
   local plumed_config_path="" saxs_source_path="" kernel_path=""
+  local patch_bundle_dir="" patch_manifest_hash="" patch_file_count=""
   local report_source_mode="online" report_source_cache="" report_mpi_provider="${MPI_PROVIDER}"
 
   report="${INSTALL_ROOT}/installation-info.txt"
@@ -4140,15 +4108,18 @@ write_installation_reports() {
     saxs_hash="$(sha256_file "${plumed_src}/src/isdb/SAXS.cpp" 2>/dev/null || true)"
     kernel_hash="$(sha256_file "${plumed_prefix}/lib/libplumedKernel.so" 2>/dev/null || true)"
     candidate_hash="$(sha256_file "${INSTALL_ROOT}/plumed_patch/SAXS.cpp" 2>/dev/null || true)"
+    patch_bundle_dir="${INSTALL_ROOT}/plumed_patch_bundle/current"
+    if [[ -f "${patch_bundle_dir}/PATCHFILES.sha256" && -d "${patch_bundle_dir}/plumed2" ]]; then
+      validate_plumed_patch_bundle_root "${patch_bundle_dir}"
+      patch_manifest_hash="${PLUMED_PATCH_VALIDATED_MANIFEST_SHA256}"
+      patch_file_count="${PLUMED_PATCH_FILE_COUNT}"
+      candidate_hash="$(sha256_file "${patch_bundle_dir}/plumed2/src/isdb/SAXS.cpp" 2>/dev/null || true)"
+    fi
     plumed_config_path="${plumed_src}/src/config/config.txt"
     saxs_source_path="${plumed_src}/src/isdb/SAXS.cpp"
     kernel_path="${plumed_prefix}/lib/libplumedKernel.so"
     linkage="$(detect_gromacs_plumed_linkage)"
 
-    # Split-layout runtime reports remain useful even when the durable worktree
-    # is temporarily unavailable.  Fall back to the tiny provenance copies
-    # stored with the installed runtime instead of losing the recorded commit
-    # and SAXS identity.
     if [[ -z "${commit}" && -s "${INSTALL_ROOT}/.installer_plumed_commit" ]]; then
       commit="$(head -n1 "${INSTALL_ROOT}/.installer_plumed_commit" 2>/dev/null || true)"
     fi
@@ -4158,7 +4129,9 @@ write_installation_reports() {
     if [[ ! -f "${plumed_config_path}" && -f "${plumed_prefix}/lib/plumed/src/config/config.txt" ]]; then
       plumed_config_path="${plumed_prefix}/lib/plumed/src/config/config.txt"
     fi
-    if [[ ! -f "${saxs_source_path}" && -f "${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp" ]]; then
+    if [[ ! -f "${saxs_source_path}" && -f "${patch_bundle_dir}/plumed2/src/isdb/SAXS.cpp" ]]; then
+      saxs_source_path="${patch_bundle_dir}/plumed2/src/isdb/SAXS.cpp"
+    elif [[ ! -f "${saxs_source_path}" && -f "${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp" ]]; then
       saxs_source_path="${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp"
     elif [[ ! -f "${saxs_source_path}" && -f "${INSTALL_ROOT}/plumed_patch/SAXS.cpp" ]]; then
       saxs_source_path="${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
@@ -4236,6 +4209,9 @@ write_installation_reports() {
     echo "PLUMED diff SHA-256 : ${plumed_diff_hash:-missing}"
     echo "PLUMED untracked    : ${plumed_untracked:-none}"
     echo "PLUMED config       : ${plumed_config_path:-not-built}"
+    echo "Patch bundle        : ${patch_bundle_dir:-not-used}"
+    echo "Patch manifest SHA  : ${patch_manifest_hash:-not-used}"
+    echo "Patch file count    : ${patch_file_count:-not-used}"
     echo "SAXS source         : ${saxs_source_path:-not-built}"
     echo "SAXS source SHA-256 : ${saxs_hash:-missing}"
     if ! is_full_stack; then
@@ -4245,7 +4221,11 @@ write_installation_reports() {
       echo "SAXS candidate      : upstream-only CPU profile (custom SAXS disabled)"
       echo "Candidate SHA-256   : not-applicable"
     else
-      echo "SAXS candidate      : ${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
+      if [[ -n "${patch_manifest_hash}" ]]; then
+        echo "SAXS candidate      : ${patch_bundle_dir}/plumed2/src/isdb/SAXS.cpp"
+      else
+        echo "SAXS candidate      : ${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
+      fi
       echo "Candidate SHA-256   : ${candidate_hash:-missing}"
     fi
     echo "Installed kernel    : ${kernel_path:-not-built}"
@@ -4255,8 +4235,22 @@ write_installation_reports() {
     echo "Patch reject files  : ${PLUMED_PATCH_REJECT_FILES:-none}"
     echo "Source mode         : ${report_source_mode}"
     echo "Source cache        : ${report_source_cache:-not-used}"
-    echo "Update history      : $([[ "${has_plumed}" -eq 1 ]] && echo "${INSTALL_ROOT}/saxs_updates/history.jsonl" || echo not-applicable)"
-    echo "Update backups      : $([[ "${has_plumed}" -eq 1 ]] && echo "${INSTALL_ROOT}/saxs_updates/backups" || echo not-applicable)"
+    if [[ "${has_plumed}" -eq 1 && -n "${patch_manifest_hash}" ]]; then
+      echo "PLUMED patch history: ${INSTALL_ROOT}/plumed_patch_updates/history.jsonl"
+      echo "PLUMED patch backups: ${INSTALL_ROOT}/plumed_patch_updates/backups"
+      echo "SAXS update history : not-applicable (manifest-managed installation)"
+      echo "SAXS update backups : not-applicable (manifest-managed installation)"
+    elif [[ "${has_plumed}" -eq 1 ]]; then
+      echo "PLUMED patch history: not-applicable"
+      echo "PLUMED patch backups: not-applicable"
+      echo "SAXS update history : ${INSTALL_ROOT}/saxs_updates/history.jsonl"
+      echo "SAXS update backups : ${INSTALL_ROOT}/saxs_updates/backups"
+    else
+      echo "PLUMED patch history: not-applicable"
+      echo "PLUMED patch backups: not-applicable"
+      echo "SAXS update history : not-applicable"
+      echo "SAXS update backups : not-applicable"
+    fi
     echo
     echo "Toolchain"
     echo "---------"
@@ -4287,12 +4281,28 @@ write_installation_reports() {
     echo "PLUMED              : ${plumed_prefix:-not-built} (${plumed_v})"
     echo "GROMACS             : ${GMX_ROOT} (${gmx_v})"
     echo
+    echo "PLUMED manifest patch update command"
+    echo "------------------------------------"
+    if ! is_full_stack || is_cpu_only; then
+      echo "not-applicable"
+    elif [[ -n "${patch_manifest_hash}" ]]; then
+      if [[ "${SPLIT_LAYOUT}" -eq 1 ]]; then
+        echo "${SCRIPT_NAME} --dir $(printf '%q' "${DIR}") --name $(printf '%q' "${NAME}") --work-dir $(printf '%q' "${WORK_DIR}") --update-plumed-patch -j ${NPROC}"
+      else
+        echo "${SCRIPT_NAME} --dir $(printf '%q' "${DIR}") --name $(printf '%q' "${NAME}") --update-plumed-patch -j ${NPROC}"
+      fi
+    else
+      echo "no manifest-driven patch recorded"
+    fi
+    echo
     echo "SAXS-only update command"
     echo "------------------------"
     if ! is_full_stack; then
       echo "not-applicable for GROMACS-only route"
     elif is_cpu_only; then
       echo "unsupported for CPU profile: custom SAXS development/update remains CUDA/ArrayFire-only pending separate validation"
+    elif [[ -n "${patch_manifest_hash}" ]]; then
+      echo "disabled for manifest-managed installation; use --update-plumed-patch"
     else
       if [[ "${SPLIT_LAYOUT}" -eq 1 ]]; then
         echo "${SCRIPT_NAME} --dir $(printf '%q' "${DIR}") --name $(printf '%q' "${NAME}") --work-dir $(printf '%q' "${WORK_DIR}") --update-saxs -j ${NPROC}"
@@ -4304,7 +4314,7 @@ write_installation_reports() {
 
   {
     printf '{\n'
-    printf '  "schema_version": 3,\n'
+    printf '  "schema_version": 4,\n'
     printf '  "updated_at_utc": %s,\n' "$(json_string "${timestamp}")"
     printf '  "host": %s,\n' "$(json_string "${host}")"
     printf '  "installer": {"name": %s, "version": %s},\n' "$(json_string "${SCRIPT_NAME}")" "$(json_string "${SCRIPT_VERSION}")"
@@ -4328,7 +4338,11 @@ write_installation_reports() {
     printf '    "patch_reject_files": %s,\n' "$(json_string "${PLUMED_PATCH_REJECT_FILES}")"
     printf '    "configuration": %s,\n' "$(json_string "${plumed_config_path}")"
     printf '    "kernel": %s,\n' "$(json_string "${kernel_path}")"
-    printf '    "kernel_sha256": %s\n' "$(json_string "${kernel_hash}")"
+    printf '    "kernel_sha256": %s,\n' "$(json_string "${kernel_hash}")"
+    printf '    "manifest_patch": {"bundle": %s, "manifest_sha256": %s, "file_count": %s, "update_history": %s, "backups": %s}\n' \
+      "$(json_string "${patch_bundle_dir}")" "$(json_string "${patch_manifest_hash}")" "$(json_string "${patch_file_count}")" \
+      "$(json_string "$([[ -n "${patch_manifest_hash}" ]] && echo "${INSTALL_ROOT}/plumed_patch_updates/history.jsonl" || true)")" \
+      "$(json_string "$([[ -n "${patch_manifest_hash}" ]] && echo "${INSTALL_ROOT}/plumed_patch_updates/backups" || true)")"
     printf '  },\n'
     printf '  "saxs": {\n'
     printf '    "source": %s,\n' "$(json_string "${saxs_source_path}")"
@@ -4340,11 +4354,15 @@ write_installation_reports() {
       printf '    "canonical_candidate": %s,\n' "$(json_string "not-applicable-upstream-only")"
       printf '    "candidate_sha256": %s,\n' "$(json_string "")"
     else
-      printf '    "canonical_candidate": %s,\n' "$(json_string "${INSTALL_ROOT}/plumed_patch/SAXS.cpp")"
+      if [[ -n "${patch_manifest_hash}" ]]; then
+        printf '    "canonical_candidate": %s,\n' "$(json_string "${patch_bundle_dir}/plumed2/src/isdb/SAXS.cpp")"
+      else
+        printf '    "canonical_candidate": %s,\n' "$(json_string "${INSTALL_ROOT}/plumed_patch/SAXS.cpp")"
+      fi
       printf '    "candidate_sha256": %s,\n' "$(json_string "${candidate_hash}")"
     fi
-    printf '    "history": %s,\n' "$(json_string "$([[ "${has_plumed}" -eq 1 ]] && echo "${INSTALL_ROOT}/saxs_updates/history.jsonl" || true)")"
-    printf '    "backups": %s\n' "$(json_string "$([[ "${has_plumed}" -eq 1 ]] && echo "${INSTALL_ROOT}/saxs_updates/backups" || true)")"
+    printf '    "history": %s,\n' "$(json_string "$([[ "${has_plumed}" -eq 1 && -z "${patch_manifest_hash}" ]] && echo "${INSTALL_ROOT}/saxs_updates/history.jsonl" || true)")"
+    printf '    "backups": %s\n' "$(json_string "$([[ "${has_plumed}" -eq 1 && -z "${patch_manifest_hash}" ]] && echo "${INSTALL_ROOT}/saxs_updates/backups" || true)")"
     printf '  },\n'
     printf '  "gromacs": {"prefix": %s, "version": %s, "plumed_linkage": %s},\n' \
       "$(json_string "${GMX_ROOT}")" "$(json_string "${gmx_v}")" "$(json_string "${linkage}")"
@@ -4379,9 +4397,7 @@ write_installation_reports() {
 }
 
 persist_postbuild_provenance() {
-  # Keep the runtime installation self-describing even when sources/builds live
-  # elsewhere. The current SAXS source copy is intentionally tiny and allows a
-  # lost split workspace to be reconstructed safely from the source cache.
+
   mkdir -p "${INSTALL_ROOT}"
   printf '%s\n' "${WORK_DIR:-}" > "${INSTALL_ROOT}/.installer_work_parent"
   printf '%s\n' "${WORK_ROOT:-${INSTALL_ROOT}}" > "${INSTALL_ROOT}/.installer_work_root"
@@ -4398,11 +4414,21 @@ persist_postbuild_provenance() {
       cp -f -- "${saxs_src}" "${keep_dir}/SAXS.cpp"
       printf '%s\n' "$(sha256_file "${saxs_src}")" > "${INSTALL_ROOT}/.installer_saxs_sha256"
     fi
+    local patch_current="${INSTALL_ROOT}/plumed_patch_bundle/current"
+    if [[ -f "${patch_current}/PATCHFILES.sha256" && -d "${patch_current}/plumed2" ]]; then
+      validate_plumed_patch_bundle_root "${patch_current}"
+      printf '%s\n' "${PLUMED_PATCH_VALIDATED_MANIFEST_SHA256}" > "${INSTALL_ROOT}/.installer_plumed_patch_manifest_sha256"
+      printf '%s\n' "${PLUMED_PATCH_FILE_COUNT}" > "${INSTALL_ROOT}/.installer_plumed_patch_file_count"
+      if [[ -f "${PLUMED_KERNEL:-}" && -n "${commit}" ]]; then
+        write_plumed_patch_installed_state "${PLUMED_PATCH_VALIDATED_MANIFEST_SHA256}" "$(sha256_file "${PLUMED_KERNEL}")" "${commit}" \
+          || warn "Could not write the PLUMED patch installed-state marker."
+      fi
+    fi
   fi
 }
 
 verify_cached_file_sha256() {
-  # verify_cached_file_sha256 <relative-path>
+
   local rel="${1}" expected actual
   [[ -s "${SOURCE_CACHE_SHA256}" ]] || die "Source-cache checksum manifest missing: ${SOURCE_CACHE_SHA256}"
   expected="$(awk -v r="${rel}" '$2==r {print $1; exit}' "${SOURCE_CACHE_SHA256}" 2>/dev/null || true)"
@@ -4411,7 +4437,7 @@ verify_cached_file_sha256() {
   [[ "${actual}" == "${expected}" ]] || die "Cached file SHA-256 mismatch for ${rel}: expected ${expected}, got ${actual}."
 }
 
-ensure_saxs_update_worktree() {
+ensure_plumed_update_worktree() {
   local plumed_src="${SRC}/plumed2"
   if [[ -d "${plumed_src}/.git" && -f "${plumed_src}/Makefile" && -f "${plumed_src}/src/config/config.txt" ]]; then
     return 0
@@ -4420,7 +4446,7 @@ ensure_saxs_update_worktree() {
   [[ "${SPLIT_LAYOUT}" -eq 1 ]] \
     || die "Configured PLUMED worktree is missing: ${plumed_src}. Legacy-layout updates require the retained configured source tree."
   [[ "${DRY_RUN}" -eq 0 ]] \
-    || die "The recorded split workspace is missing. A real --update-saxs run can reconstruct it from the recorded source cache; dry-run will not create the workspace."
+    || die "The recorded split workspace is missing. A real PLUMED source update can reconstruct it from the recorded source cache; dry-run will not create the workspace."
   [[ -n "${SOURCE_CACHE}" ]] \
     || die "Split workspace is missing and no source cache is recorded. Cannot reconstruct PLUMED safely."
 
@@ -4445,25 +4471,34 @@ ensure_saxs_update_worktree() {
   [[ "${actual_commit}" == "${expected_commit}" ]] \
     || die "Reconstructed PLUMED commit mismatch: recorded=${expected_commit}, cache=${actual_commit}."
 
-  if [[ -s "${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp" ]]; then
-    saved_saxs="${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp"
-  elif [[ -s "${INSTALL_ROOT}/plumed_patch/SAXS.cpp" ]]; then
-    saved_saxs="${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
+  local patch_current="${INSTALL_ROOT}/plumed_patch_bundle/current" recorded_patch_hash="" current_patch_hash=""
+  if [[ -f "${patch_current}/PATCHFILES.sha256" && -d "${patch_current}/plumed2" ]]; then
+    validate_plumed_patch_bundle_root "${patch_current}"
+    current_patch_hash="${PLUMED_PATCH_VALIDATED_MANIFEST_SHA256}"
+    recorded_patch_hash="$(head -n1 "${INSTALL_ROOT}/.installer_plumed_patch_manifest_sha256" 2>/dev/null || true)"
+    [[ -z "${recorded_patch_hash}" || "${recorded_patch_hash}" == "${current_patch_hash}" ]] || die "Preserved PLUMED patch manifest does not match the recorded installed state; refusing reconstruction."
+    apply_plumed_patch_bundle_root_to_tree "${patch_current}" "${plumed_src}"
+    actual_saxs="$(sha256_file "${plumed_src}/src/isdb/SAXS.cpp" 2>/dev/null || true)"
   else
-    die "No preserved installed SAXS.cpp is available to reconstruct the workspace."
+    if [[ -s "${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp" ]]; then
+      saved_saxs="${INSTALL_ROOT}/saxs_updates/current/SAXS.cpp"
+    elif [[ -s "${INSTALL_ROOT}/plumed_patch/SAXS.cpp" ]]; then
+      saved_saxs="${INSTALL_ROOT}/plumed_patch/SAXS.cpp"
+    else
+      die "No preserved PLUMED patch or SAXS source is available to reconstruct the workspace."
+    fi
+    expected_saxs="$(head -n1 "${INSTALL_ROOT}/.installer_saxs_sha256" 2>/dev/null || true)"
+    actual_saxs="$(sha256_file "${saved_saxs}")"
+    [[ -z "${expected_saxs}" || "${actual_saxs}" == "${expected_saxs}" ]] || die "Preserved SAXS source hash does not match the recorded installed state; refusing reconstruction."
+    cp -f -- "${saved_saxs}" "${plumed_src}/src/isdb/SAXS.cpp"
   fi
-  expected_saxs="$(head -n1 "${INSTALL_ROOT}/.installer_saxs_sha256" 2>/dev/null || true)"
-  actual_saxs="$(sha256_file "${saved_saxs}")"
-  [[ -z "${expected_saxs}" || "${actual_saxs}" == "${expected_saxs}" ]] \
-    || die "Preserved SAXS source hash does not match the recorded installed state; refusing reconstruction."
-  cp -f -- "${saved_saxs}" "${plumed_src}/src/isdb/SAXS.cpp"
 
   cd "${plumed_src}"
   make distclean 2>/dev/null || true
   configure_plumed_cuda_tree "${plumed_src}"
   [[ -f "${plumed_src}/Makefile" && -f "${plumed_src}/src/config/config.txt" ]] \
     || die "PLUMED workspace reconstruction did not produce a configured tree."
-  ok "Reconstructed configured PLUMED workspace at ${plumed_src} (commit ${actual_commit}, SAXS ${actual_saxs})."
+  ok "Reconstructed configured PLUMED workspace at ${plumed_src} (commit ${actual_commit})."
 }
 
 validate_split_runtime_independence() {
@@ -4499,14 +4534,12 @@ setup_saxs_update_environment() {
   local activate="${INSTALL_ROOT}/activate.sh"
   if [[ -f "${INSTALL_ROOT}/.installer_accelerator" ]] \
      && [[ "$(head -n1 "${INSTALL_ROOT}/.installer_accelerator" 2>/dev/null || true)" == "cpu" ]]; then
-    die "This is a CPU-only installation. CPU support for the custom SAXS-development/update workflow is intentionally out of scope; use the validated CUDA/ArrayFire SAXS environment for --update-saxs."
+    die "This is a CPU-only installation. Custom PLUMED source-update workflows are supported only for the validated CUDA/ArrayFire profile."
   fi
   [[ -f "${activate}" ]] || die "Activation script not found: ${activate}"
   load_persisted_install_profile
   resolve_paths
-  # This is the activation file generated for the selected installation. It
-  # pins the dependency paths used by that build, avoiding toolchain drift.
-  # shellcheck disable=SC1090
+
   source "${activate}" >/dev/null
   [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/nvcc" ]] \
     || die "The existing activate.sh does not provide a usable CUDA_HOME/bin/nvcc."
@@ -4616,9 +4649,6 @@ prepare_saxs_update_backup() {
     cp -- "${canonical}" "${SAXS_UPDATE_BACKUP_DIR}/SAXS.cpp.previous-canonical"
   fi
 
-  # Preserve the complete pre-update tracked worktree state outside SAXS.cpp.
-  # This keeps generated files such as python/plumed.c from contaminating the
-  # retained Git tree, and it also preserves explicitly allowed dirty files.
   SAXS_UPDATE_TRACKED_DIRTY_LIST="${SAXS_UPDATE_BACKUP_DIR}/tracked-dirty-before.txt"
   SAXS_UPDATE_TRACKED_MISSING_LIST="${SAXS_UPDATE_BACKUP_DIR}/tracked-missing-before.txt"
   SAXS_UPDATE_TRACKED_DIRTY_ARCHIVE="${SAXS_UPDATE_BACKUP_DIR}/tracked-existing-before.tar"
@@ -4642,8 +4672,6 @@ prepare_saxs_update_backup() {
     SAXS_UPDATE_TRACKED_DIRTY_ARCHIVE=""
   fi
 
-  # Keep the v30 shared-library copies for quick inspection/backward-compatible
-  # diagnostics, but v31 rollback uses the complete prefix snapshot below.
   shopt -s nullglob
   local plumed_libs=("${PLUMED_ROOT}/lib"/libplumed*.so*)
   shopt -u nullglob
@@ -4652,9 +4680,6 @@ prepare_saxs_update_backup() {
     cp -a -- "${lib}" "${SAXS_UPDATE_BACKUP_DIR}/installed-lib/"
   done
 
-  # make install can replace more than libplumed*.so*: executables, headers,
-  # static libraries, CMake/pkg-config files, Python modules and data. Snapshot
-  # the entire installed PLUMED prefix so rollback removes partial/new files too.
   prefix_parent="$(dirname "${PLUMED_ROOT}")"
   prefix_name="$(basename "${PLUMED_ROOT}")"
   snapshot="${SAXS_UPDATE_BACKUP_DIR}/plumed-prefix.before.tar"
@@ -4693,10 +4718,8 @@ prepare_saxs_update_backup() {
   ok "Transactional rollback snapshot created: ${SAXS_UPDATE_BACKUP_DIR}"
 }
 
-
 restore_saxs_update_tracked_source_state() {
-  # Restore every tracked PLUMED path outside src/isdb/SAXS.cpp to its exact
-  # pre-update worktree state. The Git index is intentionally untouched.
+
   local plumed_src="${SRC}/plumed2" before="${SAXS_UPDATE_TRACKED_DIRTY_LIST}"
   local missing="${SAXS_UPDATE_TRACKED_MISSING_LIST}" archive="${SAXS_UPDATE_TRACKED_DIRTY_ARCHIVE}"
   local after path
@@ -4705,8 +4728,6 @@ restore_saxs_update_tracked_source_state() {
   git -C "${plumed_src}" diff --name-only HEAD -- 2>/dev/null \
     | sed '/^src\/isdb\/SAXS\.cpp$/d; /^$/d' | sort -u > "${after}"
 
-  # Any newly dirtied tracked path was clean before the update: restore it from
-  # HEAD. This covers generated Cython/config files without special-casing them.
   while IFS= read -r path; do
     [[ -n "${path}" ]] || continue
     if ! grep -Fxq -- "${path}" "${before}"; then
@@ -4715,7 +4736,6 @@ restore_saxs_update_tracked_source_state() {
     fi
   done < "${after}"
 
-  # Reapply exact pre-existing dirty working-tree bytes/modes, if any.
   if [[ -n "${archive}" && -f "${archive}" ]]; then
     tar -C "${plumed_src}" -xpf "${archive}" || return 1
   fi
@@ -4726,8 +4746,6 @@ restore_saxs_update_tracked_source_state() {
     done < "${missing}"
   fi
 
-  # Verify that the set of tracked dirty paths outside SAXS is exactly the same
-  # as before. Content for pre-existing files came from the snapshot above.
   git -C "${plumed_src}" diff --name-only HEAD -- 2>/dev/null \
     | sed '/^src\/isdb\/SAXS\.cpp$/d; /^$/d' | sort -u > "${after}"
   cmp -s -- "${before}" "${after}"
@@ -4797,9 +4815,6 @@ restore_failed_saxs_update() {
     fi
   fi
 
-  # Backward-compatible emergency fallback if the complete snapshot could not
-  # be restored. This cannot remove files introduced by a partial make install,
-  # so v31 reports the degraded rollback state explicitly.
   if [[ "${restored}" -eq 0 ]]; then
     warn "Complete-prefix rollback was unavailable/failed; falling back to saved libplumed shared libraries."
     mkdir -p "${PLUMED_ROOT}/lib"
@@ -4856,6 +4871,411 @@ append_saxs_update_history() {
     "$(json_string "${note}")" >> "${history}"
 }
 
+plumed_patch_update_managed_target_list() {
+  [[ -z "${PATCH_UPDATE_BUNDLE:-}" ]] || plumed_patch_target_list "${PATCH_UPDATE_BUNDLE}"
+  if [[ -n "${PATCH_UPDATE_OLD_BUNDLE:-}" && -f "${PATCH_UPDATE_OLD_BUNDLE}/PATCHFILES.sha256" ]]; then
+    plumed_patch_target_list "${PATCH_UPDATE_OLD_BUNDLE}"
+  fi
+}
+
+plumed_patch_removed_target_list() {
+  local old_root="${1}" new_root="${2}" old_list new_list
+  [[ -n "${old_root}" && -f "${old_root}/PATCHFILES.sha256" ]] || return 0
+  old_list="$(mktemp "${TMPDIR:-/tmp}/plumed-old-targets.XXXXXX")"
+  new_list="$(mktemp "${TMPDIR:-/tmp}/plumed-new-targets.XXXXXX")"
+  plumed_patch_target_list "${old_root}" | sort -u > "${old_list}"
+  plumed_patch_target_list "${new_root}" | sort -u > "${new_list}"
+  comm -23 "${old_list}" "${new_list}"
+  rm -f -- "${old_list}" "${new_list}"
+}
+
+reconcile_removed_plumed_patch_targets() {
+  local old_root="${1}" new_root="${2}" plumed_src="${3}" rel
+  [[ -n "${old_root}" && -f "${old_root}/PATCHFILES.sha256" ]] || return 0
+  while IFS= read -r rel; do
+    [[ -n "${rel}" ]] || continue
+    if git -C "${plumed_src}" ls-files --error-unmatch -- "${rel}" >/dev/null 2>&1; then
+      git -C "${plumed_src}" restore --source=HEAD --worktree -- "${rel}" || die "Could not restore removed patch target to upstream state: ${rel}"
+    else
+      rm -f -- "${plumed_src}/${rel}" || die "Could not remove obsolete patch-added file: ${rel}"
+    fi
+  done < <(plumed_patch_removed_target_list "${old_root}" "${new_root}")
+}
+
+verify_removed_plumed_patch_targets_reconciled() {
+  local old_root="${1}" new_root="${2}" plumed_src="${3}" rel
+  [[ -n "${old_root}" && -f "${old_root}/PATCHFILES.sha256" ]] || return 0
+  while IFS= read -r rel; do
+    [[ -n "${rel}" ]] || continue
+    if git -C "${plumed_src}" ls-files --error-unmatch -- "${rel}" >/dev/null 2>&1; then
+      git -C "${plumed_src}" diff --quiet HEAD -- "${rel}" || return 1
+    else
+      [[ ! -e "${plumed_src}/${rel}" && ! -L "${plumed_src}/${rel}" ]] || return 1
+    fi
+  done < <(plumed_patch_removed_target_list "${old_root}" "${new_root}")
+}
+
+plumed_patch_installed_state_matches() {
+  local manifest_hash="${1}" kernel_hash="${2}" commit="${3}"
+  local state="${INSTALL_ROOT}/plumed_patch_updates/installed-state.txt" key value recorded_manifest="" recorded_kernel="" recorded_commit=""
+  [[ -f "${state}" ]] || return 1
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      manifest_sha256) recorded_manifest="${value}" ;;
+      kernel_sha256) recorded_kernel="${value}" ;;
+      plumed_commit) recorded_commit="${value}" ;;
+    esac
+  done < "${state}"
+  [[ "${recorded_manifest}" == "${manifest_hash}" && "${recorded_kernel}" == "${kernel_hash}" && "${recorded_commit}" == "${commit}" ]]
+}
+
+write_plumed_patch_installed_state() {
+  local manifest_hash="${1}" kernel_hash="${2}" commit="${3}"
+  local state_dir="${INSTALL_ROOT}/plumed_patch_updates" state tmp
+  state="${state_dir}/installed-state.txt"
+  mkdir -p "${state_dir}" || return 1
+  tmp="$(mktemp "${state_dir}/.installed-state.XXXXXX")" || return 1
+  {
+    echo "installed_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "manifest_sha256=${manifest_hash}"
+    echo "kernel_sha256=${kernel_hash}"
+    echo "plumed_commit=${commit}"
+    echo "update_id=${PATCH_UPDATE_ID}"
+  } > "${tmp}" || { rm -f -- "${tmp}"; return 1; }
+  mv -f -- "${tmp}" "${state}"
+}
+
+prepare_plumed_patch_update_candidate() {
+  local canonical
+  canonical="$(plumed_patch_canonical_dir)"
+  PATCH_UPDATE_OLD_BUNDLE=""
+  if [[ -f "${canonical}/PATCHFILES.sha256" && -d "${canonical}/plumed2" ]]; then
+    validate_plumed_patch_bundle_root "${canonical}"
+    PATCH_UPDATE_OLD_BUNDLE="${canonical}"
+  fi
+  if [[ -n "${PLUMED_PATCH_BUNDLE}" ]]; then
+    prepare_plumed_patch_bundle_input "${PLUMED_PATCH_BUNDLE}"
+    PATCH_UPDATE_BUNDLE="${PLUMED_PATCH_PREPARED_ROOT}"
+  else
+    [[ -f "${canonical}/PATCHFILES.sha256" && -d "${canonical}/plumed2" ]] || die "No installed PLUMED patch bundle is available. Pass --plumed-patch-bundle <archive-or-directory>."
+    validate_plumed_patch_bundle_root "${canonical}"
+    PATCH_UPDATE_BUNDLE="${canonical}"
+  fi
+  validate_plumed_patch_bundle_root "${PATCH_UPDATE_BUNDLE}"
+  PATCH_UPDATE_MANIFEST_SHA256="${PLUMED_PATCH_VALIDATED_MANIFEST_SHA256}"
+}
+
+validate_plumed_patch_update_install() {
+  local root="${1}" plumed_src="${SRC}/plumed2" config_install prefix_record prefix_ok=0 linkage targets dirty all_dirty
+  [[ -d "${INSTALL_ROOT}" ]] || die "Existing install root not found: ${INSTALL_ROOT}"
+  [[ -d "${plumed_src}/.git" ]] || die "Configured PLUMED Git checkout not found: ${plumed_src}"
+  [[ -f "${plumed_src}/Makefile" ]] || die "PLUMED checkout is not configured: ${plumed_src}"
+  [[ -f "${plumed_src}/src/config/config.txt" ]] || die "PLUMED configuration record missing."
+  [[ -x "${PLUMED_ROOT}/bin/plumed" ]] || die "Installed PLUMED executable missing: ${PLUMED_ROOT}/bin/plumed"
+  [[ -f "${PLUMED_KERNEL}" ]] || die "Installed PLUMED kernel missing: ${PLUMED_KERNEL}"
+  [[ -x "${MPI_ROOT}/bin/mpicxx" ]] || die "MPI C++ wrapper missing: ${MPI_ROOT}/bin/mpicxx"
+  config_install="${plumed_src}/src/config/ConfigInstall.inc"
+  for prefix_record in "${config_install}" "${plumed_src}/config.status" "${plumed_src}/Makefile.conf"; do
+    [[ -f "${prefix_record}" ]] || continue
+    grep -Fq "${PLUMED_ROOT}" "${prefix_record}" && prefix_ok=1
+  done
+  [[ "${prefix_ok}" -eq 1 ]] || die "Could not confirm ${PLUMED_ROOT} as the configured PLUMED install prefix."
+  grep -Eq 'has arrayfire_cuda[[:space:]]+(on|yes)|__PLUMED_HAS_ARRAYFIRE_CUDA' "${plumed_src}/src/config/config.txt" || die "Retained PLUMED configuration does not report ArrayFire CUDA support."
+  grep -Eq 'module isdb[[:space:]]+on' "${plumed_src}/src/config/config.txt" || die "Retained PLUMED configuration does not report ISDB enabled."
+  targets="$(mktemp "${TMPDIR:-/tmp}/plumed-patch-targets.XXXXXX")"
+  plumed_patch_update_managed_target_list | sort -u > "${targets}"
+  if [[ "${ALLOW_DIRTY_PLUMED}" -eq 0 ]]; then
+    all_dirty="$(mktemp "${TMPDIR:-/tmp}/plumed-patch-dirty.XXXXXX")"
+    git -C "${plumed_src}" diff --name-only HEAD -- 2>/dev/null | sed '/^$/d' | sort -u > "${all_dirty}"
+    dirty="$(grep -Fvx -f "${targets}" "${all_dirty}" 2>/dev/null || true)"
+    rm -f -- "${all_dirty}"
+    [[ -z "${dirty}" ]] || { rm -f -- "${targets}"; die "PLUMED has tracked changes outside the patch manifest:\n${dirty}"; }
+  fi
+  rm -f -- "${targets}"
+  linkage="$(detect_gromacs_plumed_linkage)"
+  [[ "${linkage}" != "unknown" ]] || die "Could not verify installed GROMACS/PLUMED shared/runtime linkage."
+}
+
+prepare_plumed_patch_update_backup() {
+  local root="${1}" plumed_src="${SRC}/plumed2" backup_root="${INSTALL_ROOT}/plumed_patch_updates/backups"
+  local target rel prefix_parent prefix_name prefix_size_kb avail_kb safety_kb snapshot tracked_path
+  PATCH_UPDATE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  PATCH_UPDATE_BACKUP_DIR="${backup_root}/${PATCH_UPDATE_ID}"
+  mkdir -p "${PATCH_UPDATE_BACKUP_DIR}"
+  PATCH_UPDATE_TARGET_EXISTING_LIST="${PATCH_UPDATE_BACKUP_DIR}/targets-existing-before.txt"
+  PATCH_UPDATE_TARGET_MISSING_LIST="${PATCH_UPDATE_BACKUP_DIR}/targets-missing-before.txt"
+  PATCH_UPDATE_TARGET_ARCHIVE="${PATCH_UPDATE_BACKUP_DIR}/targets-existing-before.tar"
+  : > "${PATCH_UPDATE_TARGET_EXISTING_LIST}"
+  : > "${PATCH_UPDATE_TARGET_MISSING_LIST}"
+  while IFS= read -r rel; do
+    [[ -n "${rel}" ]] || continue
+    if [[ -e "${plumed_src}/${rel}" || -L "${plumed_src}/${rel}" ]]; then
+      printf '%s\n' "${rel}" >> "${PATCH_UPDATE_TARGET_EXISTING_LIST}"
+    else
+      printf '%s\n' "${rel}" >> "${PATCH_UPDATE_TARGET_MISSING_LIST}"
+    fi
+  done < <(plumed_patch_update_managed_target_list | sort -u)
+  if [[ -s "${PATCH_UPDATE_TARGET_EXISTING_LIST}" ]]; then
+    tar -C "${plumed_src}" --verbatim-files-from -cpf "${PATCH_UPDATE_TARGET_ARCHIVE}" -T "${PATCH_UPDATE_TARGET_EXISTING_LIST}" || die "Could not snapshot existing PLUMED patch targets."
+  else
+    PATCH_UPDATE_TARGET_ARCHIVE=""
+  fi
+  PATCH_UPDATE_OTHER_DIRTY_LIST="${PATCH_UPDATE_BACKUP_DIR}/other-dirty-before.txt"
+  PATCH_UPDATE_OTHER_MISSING_LIST="${PATCH_UPDATE_BACKUP_DIR}/other-missing-before.txt"
+  PATCH_UPDATE_OTHER_ARCHIVE="${PATCH_UPDATE_BACKUP_DIR}/other-existing-before.tar"
+  local target_set="${PATCH_UPDATE_BACKUP_DIR}/target-set.txt" other_existing="${PATCH_UPDATE_BACKUP_DIR}/other-existing-before.txt" all_dirty="${PATCH_UPDATE_BACKUP_DIR}/all-dirty-before.txt"
+  plumed_patch_update_managed_target_list | sort -u > "${target_set}"
+  git -C "${plumed_src}" diff --name-only HEAD -- 2>/dev/null | sed '/^$/d' | sort -u > "${all_dirty}"
+  grep -Fvx -f "${target_set}" "${all_dirty}" 2>/dev/null > "${PATCH_UPDATE_OTHER_DIRTY_LIST}" || true
+  : > "${PATCH_UPDATE_OTHER_MISSING_LIST}"
+  : > "${other_existing}"
+  while IFS= read -r tracked_path; do
+    [[ -n "${tracked_path}" ]] || continue
+    if [[ -e "${plumed_src}/${tracked_path}" || -L "${plumed_src}/${tracked_path}" ]]; then
+      printf '%s\n' "${tracked_path}" >> "${other_existing}"
+    else
+      printf '%s\n' "${tracked_path}" >> "${PATCH_UPDATE_OTHER_MISSING_LIST}"
+    fi
+  done < "${PATCH_UPDATE_OTHER_DIRTY_LIST}"
+  if [[ -s "${other_existing}" ]]; then
+    tar -C "${plumed_src}" --verbatim-files-from -cpf "${PATCH_UPDATE_OTHER_ARCHIVE}" -T "${other_existing}" || die "Could not snapshot pre-existing PLUMED tracked changes."
+  else
+    PATCH_UPDATE_OTHER_ARCHIVE=""
+  fi
+  cp -p -- "${root}/PATCHFILES.sha256" "${PATCH_UPDATE_BACKUP_DIR}/PATCHFILES.candidate.sha256"
+  prefix_parent="$(dirname "${PLUMED_ROOT}")"
+  prefix_name="$(basename "${PLUMED_ROOT}")"
+  snapshot="${PATCH_UPDATE_BACKUP_DIR}/plumed-prefix.before.tar"
+  prefix_size_kb="$(du -sk "${PLUMED_ROOT}" 2>/dev/null | awk '{print $1}')"
+  avail_kb="$(df -Pk "${PATCH_UPDATE_BACKUP_DIR}" 2>/dev/null | awk 'NR==2{print $4}')"
+  safety_kb=$((100*1024))
+  if [[ -n "${prefix_size_kb}" && -n "${avail_kb}" ]]; then
+    (( avail_kb > prefix_size_kb + safety_kb )) || die "Insufficient free space for transactional PLUMED prefix snapshot."
+  fi
+  tar -C "${prefix_parent}" -cpf "${snapshot}" "${prefix_name}" || die "Could not create complete PLUMED prefix snapshot."
+  PATCH_UPDATE_PREFIX_SNAPSHOT="${snapshot}"
+  PATCH_UPDATE_PREFIX_SNAPSHOT_SHA256="$(sha256_file "${snapshot}")"
+  {
+    echo "backup_id=${PATCH_UPDATE_ID}"
+    echo "created_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "plumed_commit=${PATCH_UPDATE_COMMIT}"
+    echo "manifest_sha256=${PATCH_UPDATE_MANIFEST_SHA256}"
+    echo "patch_files=$(wc -l < "${root}/PATCHFILES.sha256" | tr -d ' ')"
+    echo "prefix_snapshot_sha256=${PATCH_UPDATE_PREFIX_SNAPSHOT_SHA256}"
+    echo "status=prepared"
+  } > "${PATCH_UPDATE_BACKUP_DIR}/backup-info.txt"
+  ok "Transactional PLUMED patch rollback snapshot created: ${PATCH_UPDATE_BACKUP_DIR}"
+}
+
+restore_plumed_patch_other_state() {
+  local root="${1}" plumed_src="${SRC}/plumed2" target_set after path
+  [[ -d "${plumed_src}/.git" ]] || return 0
+  target_set="${PATCH_UPDATE_BACKUP_DIR}/target-set.txt"
+  after="${PATCH_UPDATE_BACKUP_DIR}/other-dirty-after-build.txt"
+  git -C "${plumed_src}" diff --name-only HEAD -- 2>/dev/null | sed '/^$/d' | sort -u > "${after}.all"
+  grep -Fvx -f "${target_set}" "${after}.all" 2>/dev/null > "${after}" || true
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] || continue
+    if ! grep -Fxq -- "${path}" "${PATCH_UPDATE_OTHER_DIRTY_LIST}"; then
+      git -C "${plumed_src}" restore --source=HEAD --worktree -- "${path}" || return 1
+    fi
+  done < "${after}"
+  if [[ -n "${PATCH_UPDATE_OTHER_ARCHIVE}" && -f "${PATCH_UPDATE_OTHER_ARCHIVE}" ]]; then
+    tar -C "${plumed_src}" -xpf "${PATCH_UPDATE_OTHER_ARCHIVE}" || return 1
+  fi
+  if [[ -f "${PATCH_UPDATE_OTHER_MISSING_LIST}" ]]; then
+    while IFS= read -r path; do [[ -z "${path}" ]] || rm -f -- "${plumed_src}/${path}" || return 1; done < "${PATCH_UPDATE_OTHER_MISSING_LIST}"
+  fi
+  git -C "${plumed_src}" diff --name-only HEAD -- 2>/dev/null | sed '/^$/d' | sort -u > "${after}.all"
+  grep -Fvx -f "${target_set}" "${after}.all" 2>/dev/null > "${after}" || true
+  cmp -s -- "${PATCH_UPDATE_OTHER_DIRTY_LIST}" "${after}"
+}
+
+restore_plumed_patch_targets() {
+  local plumed_src="${SRC}/plumed2" path
+  while IFS= read -r path; do [[ -z "${path}" ]] || rm -f -- "${plumed_src}/${path}"; done < "${PATCH_UPDATE_TARGET_MISSING_LIST}"
+  if [[ -n "${PATCH_UPDATE_TARGET_ARCHIVE}" && -f "${PATCH_UPDATE_TARGET_ARCHIVE}" ]]; then
+    tar -C "${plumed_src}" -xpf "${PATCH_UPDATE_TARGET_ARCHIVE}" || return 1
+  fi
+}
+
+restore_failed_plumed_patch_update() {
+  [[ "${PATCH_UPDATE_ACTIVE}" -eq 1 && -n "${PATCH_UPDATE_BACKUP_DIR}" ]] || return 0
+  local prefix_snapshot prefix_parent prefix_name restore_stage failed_live current_hash restored=0
+  trap - ERR
+  set +e
+  restore_plumed_patch_targets || warn "Could not fully restore PLUMED patch target files."
+  restore_plumed_patch_other_state "${PATCH_UPDATE_BUNDLE}" || warn "Could not fully restore unrelated PLUMED tracked-source state."
+  prefix_snapshot="${PATCH_UPDATE_PREFIX_SNAPSHOT}"
+  if [[ -f "${prefix_snapshot}" ]]; then
+    current_hash="$(sha256_file "${prefix_snapshot}" 2>/dev/null || true)"
+    if [[ "${current_hash}" == "${PATCH_UPDATE_PREFIX_SNAPSHOT_SHA256}" ]]; then
+      prefix_parent="$(dirname "${PLUMED_ROOT}")"; prefix_name="$(basename "${PLUMED_ROOT}")"
+      restore_stage="${INSTALL_ROOT}/.plumed-patch-restore-${PATCH_UPDATE_ID}-$$"
+      failed_live="${INSTALL_ROOT}/.plumed-patch-failed-${PATCH_UPDATE_ID}-$$"
+      rm -rf -- "${restore_stage}" "${failed_live}"; mkdir -p "${restore_stage}"
+      if tar -C "${restore_stage}" -xpf "${prefix_snapshot}" && [[ -d "${restore_stage}/${prefix_name}" ]]; then
+        if [[ -e "${PLUMED_ROOT}" || -L "${PLUMED_ROOT}" ]]; then mv -- "${PLUMED_ROOT}" "${failed_live}"; fi
+        if mv -- "${restore_stage}/${prefix_name}" "${PLUMED_ROOT}"; then restored=1; rm -rf -- "${failed_live}" "${restore_stage}"; else [[ ! -e "${failed_live}" ]] || mv -- "${failed_live}" "${PLUMED_ROOT}"; fi
+      fi
+    fi
+  fi
+  echo "status=failed-restored" >> "${PATCH_UPDATE_BACKUP_DIR}/backup-info.txt"
+  echo "rollback_complete_prefix=${restored}" >> "${PATCH_UPDATE_BACKUP_DIR}/backup-info.txt"
+  cleanup_prepared_plumed_patch_bundle
+  set -e
+  PATCH_UPDATE_ACTIVE=0
+  warn "PLUMED patch update failed and rollback was attempted from ${PATCH_UPDATE_BACKUP_DIR}."
+}
+
+handle_failed_plumed_patch_update() {
+  local rc="${1:-1}" note="${2:-operation failed}" line="${3:-unknown}"
+  [[ "${PATCH_UPDATE_ACTIVE:-0}" -eq 1 ]] || return 0
+  [[ "${PATCH_UPDATE_FAILURE_HANDLED:-0}" -eq 0 ]] || return 0
+  PATCH_UPDATE_FAILURE_HANDLED=1
+  restore_failed_plumed_patch_update
+  set +e
+  append_plumed_patch_update_history "failed-restored" "${note} at line ${line} with exit ${rc}"
+  set -e
+}
+
+append_plumed_patch_update_history() {
+  local status="${1}" note="${2:-}" history="${INSTALL_ROOT}/plumed_patch_updates/history.jsonl"
+  mkdir -p "$(dirname "${history}")"
+  printf '{"timestamp_utc":%s,"status":%s,"update_id":%s,"plumed_commit":%s,"manifest_sha256":%s,"backup":%s,"note":%s}\n' \
+    "$(json_string "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" \
+    "$(json_string "${status}")" \
+    "$(json_string "${PATCH_UPDATE_ID}")" \
+    "$(json_string "${PATCH_UPDATE_COMMIT}")" \
+    "$(json_string "${PATCH_UPDATE_MANIFEST_SHA256}")" \
+    "$(json_string "${PATCH_UPDATE_BACKUP_DIR}")" \
+    "$(json_string "${note}")" >> "${history}"
+}
+
+validate_built_plumed_patch() {
+  local root="${1}" plumed_src="${2}" build_kernel build_plumed build_libdir info_out
+  build_kernel="$(plumed_build_kernel_path "${plumed_src}")" || die "No build-tree PLUMED kernel found after patch build."
+  assert_no_missing_libs "${build_kernel}" "Build-tree PLUMED kernel"
+  if grep -qE '  plumed2/src/isdb/SAXS\.cpp$' "${root}/PATCHFILES.sha256"; then
+    build_plumed="$(plumed_build_executable_path "${plumed_src}")" || die "No build-tree plumed executable found."
+    build_libdir="${plumed_src}/src/lib"
+    info_out="${PATCH_UPDATE_BACKUP_DIR}/plumed-manual-build-tree.txt"
+    env -u PLUMED_ROOT -u PLUMED_PREFIX -u PLUMED_KERNEL -u PLUMED_INSTALL_PREFIX LD_LIBRARY_PATH="${build_libdir}:${LD_LIBRARY_PATH:-}" PLUMED_PREPEND_PATH="${build_libdir}" "${build_plumed}" --no-mpi manual --action SAXS > "${info_out}" 2>&1 || die "Build-tree SAXS action validation failed."
+    grep -q 'SAXS' "${info_out}" || die "Build-tree PLUMED does not expose SAXS after patch build."
+  fi
+  ok "Build-tree PLUMED patch validation passed."
+}
+
+validate_installed_plumed_patch() {
+  local root="${1}" info_out
+  [[ -f "${PLUMED_KERNEL}" ]] || die "Installed PLUMED kernel missing after patch install."
+  assert_no_missing_libs "${PLUMED_KERNEL}" "Installed PLUMED kernel"
+  env PLUMED_PREFIX="${PLUMED_ROOT}" PLUMED_ROOT="${PLUMED_ROOT}/lib/plumed" PLUMED_KERNEL="${PLUMED_KERNEL}" "${PLUMED_ROOT}/bin/plumed" --is-installed
+  if grep -qE '  plumed2/src/isdb/SAXS\.cpp$' "${root}/PATCHFILES.sha256"; then
+    info_out="${PATCH_UPDATE_BACKUP_DIR}/plumed-manual-installed.txt"
+    env PLUMED_PREFIX="${PLUMED_ROOT}" PLUMED_ROOT="${PLUMED_ROOT}/lib/plumed" PLUMED_KERNEL="${PLUMED_KERNEL}" "${PLUMED_ROOT}/bin/plumed" --no-mpi manual --action SAXS > "${info_out}" 2>&1 || die "Installed SAXS action validation failed."
+    grep -q 'SAXS' "${info_out}" || die "Installed PLUMED does not expose SAXS after patch install."
+  fi
+  ok "Installed PLUMED patch validation passed."
+}
+
+print_plumed_patch_update_plan() {
+  local root="${1}" commit="${2}" linkage="${3}" count
+  count="$(wc -l < "${root}/PATCHFILES.sha256" | tr -d ' ')"
+  section "PLUMED manifest patch update plan"
+  printf '  %-24s : %s\n' "Install root" "${INSTALL_ROOT}"
+  printf '  %-24s : %s\n' "PLUMED source" "${SRC}/plumed2"
+  printf '  %-24s : %s\n' "PLUMED commit" "${commit}"
+  printf '  %-24s : %s\n' "Patch files" "${count}"
+  printf '  %-24s : %s\n' "Manifest SHA-256" "${PATCH_UPDATE_MANIFEST_SHA256}"
+  printf '  %-24s : %s\n' "GROMACS linkage" "${linkage}"
+  printf '  %-24s : %s\n' "Parallel jobs" "${NPROC}"
+  printf '  %-24s : %s\n' "PLUMED installcheck" "$([[ "${RUN_INSTALLCHECK}" -eq 1 ]] && echo enabled || echo skipped)"
+  printf '  %-24s : %s\n' "Rollback scope" "all patch targets + unrelated tracked state + complete PLUMED prefix"
+}
+
+run_plumed_patch_update() {
+  local plumed_src linkage gmx_bin="" gmx_hash_before="" gmx_hash_after="" canonical current_recorded=""
+  CURRENT_OPERATION="update-plumed-patch"
+  [[ -d "${INSTALL_ROOT}" ]] || die "Existing install root not found: ${INSTALL_ROOT}"
+  load_persisted_install_profile
+  resolve_paths
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    mkdir -p "${LOG_DIR}"
+    LOG_FILE="${LOG_DIR}/plumed_patch_update_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
+    exec > >(tee -a "${LOG_FILE}") 2>&1
+    command -v flock >/dev/null 2>&1 || die "flock is required for safe PLUMED patch updates."
+    exec 9>"${INSTALL_ROOT}/.plumed-patch-update.lock"
+    flock -n 9 || die "Another PLUMED patch update appears to be running for ${INSTALL_ROOT}."
+  fi
+  setup_saxs_update_environment
+  ensure_plumed_update_worktree
+  plumed_src="${SRC}/plumed2"
+  prepare_plumed_patch_update_candidate
+  validate_plumed_patch_update_install "${PATCH_UPDATE_BUNDLE}"
+  inspect_saxs_update_python "${plumed_src}"
+  PATCH_UPDATE_COMMIT="$(git -C "${plumed_src}" rev-parse HEAD)"
+  linkage="$(detect_gromacs_plumed_linkage)"
+  print_plumed_patch_update_plan "${PATCH_UPDATE_BUNDLE}" "${PATCH_UPDATE_COMMIT}" "${linkage}"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then cleanup_prepared_plumed_patch_bundle; info "Dry run complete; no files were changed."; return 0; fi
+  current_recorded="$(head -n1 "${INSTALL_ROOT}/.installer_plumed_patch_manifest_sha256" 2>/dev/null || true)"
+  local current_kernel_hash="$(sha256_file "${PLUMED_KERNEL}" 2>/dev/null || true)"
+  if [[ "${FORCE}" -eq 0 && "${current_recorded}" == "${PATCH_UPDATE_MANIFEST_SHA256}" ]] \
+     && plumed_patch_tree_matches "${PATCH_UPDATE_BUNDLE}" "${plumed_src}" \
+     && plumed_patch_installed_state_matches "${PATCH_UPDATE_MANIFEST_SHA256}" "${current_kernel_hash}" "${PATCH_UPDATE_COMMIT}"; then
+    info "Patch manifest, retained targets, and installed kernel state already match; nothing was rebuilt."
+    cleanup_prepared_plumed_patch_bundle
+    persist_postbuild_provenance
+    write_installation_reports "plumed-patch-update-noop"
+    return 0
+  fi
+  if [[ -x "${GMX_ROOT}/bin/gmx_mpi" ]]; then gmx_bin="${GMX_ROOT}/bin/gmx_mpi"; elif [[ -x "${GMX_ROOT}/bin/gmx" ]]; then gmx_bin="${GMX_ROOT}/bin/gmx"; fi
+  [[ -z "${gmx_bin}" ]] || gmx_hash_before="$(sha256_file "${gmx_bin}")"
+  prepare_plumed_patch_update_backup "${PATCH_UPDATE_BUNDLE}"
+  PATCH_UPDATE_ACTIVE=1
+  ensure_saxs_update_python_build_module
+  reconcile_removed_plumed_patch_targets "${PATCH_UPDATE_OLD_BUNDLE}" "${PATCH_UPDATE_BUNDLE}" "${plumed_src}"
+  apply_plumed_patch_bundle_root_to_tree "${PATCH_UPDATE_BUNDLE}" "${plumed_src}"
+  verify_removed_plumed_patch_targets_reconciled "${PATCH_UPDATE_OLD_BUNDLE}" "${PATCH_UPDATE_BUNDLE}" "${plumed_src}" || die "Obsolete targets from the previous PLUMED patch bundle were not reconciled correctly."
+  cd "${plumed_src}"
+  env -u PLUMED_ROOT -u PLUMED_INSTALL_PREFIX -u PLUMED_KERNEL -u PLUMED_PREFIX make -B -j"${NPROC}"
+  plumed_patch_tree_matches "${PATCH_UPDATE_BUNDLE}" "${plumed_src}" || die "PLUMED patch targets changed during the build."
+  verify_removed_plumed_patch_targets_reconciled "${PATCH_UPDATE_OLD_BUNDLE}" "${PATCH_UPDATE_BUNDLE}" "${plumed_src}" || die "Obsolete PLUMED patch targets reappeared during the build."
+  validate_built_plumed_patch "${PATCH_UPDATE_BUNDLE}" "${plumed_src}"
+  env -u PLUMED_ROOT -u PLUMED_INSTALL_PREFIX -u PLUMED_KERNEL -u PLUMED_PREFIX make install
+  validate_installed_plumed_patch "${PATCH_UPDATE_BUNDLE}"
+  if [[ "${RUN_INSTALLCHECK}" -eq 1 ]]; then
+    env PATH="${PLUMED_ROOT}/bin:${PATH}" PLUMED_PREFIX="${PLUMED_ROOT}" PLUMED_ROOT="${PLUMED_ROOT}/lib/plumed" PLUMED_KERNEL="${PLUMED_KERNEL}" make installcheck
+    ok "PLUMED installcheck completed."
+  fi
+  restore_plumed_patch_other_state "${PATCH_UPDATE_BUNDLE}" || die "Could not restore unrelated retained PLUMED tracked-source state."
+  if [[ -n "${gmx_bin}" ]]; then
+    gmx_hash_after="$(sha256_file "${gmx_bin}")"
+    [[ "${gmx_hash_before}" == "${gmx_hash_after}" ]] || die "Installed GROMACS changed during PLUMED patch update."
+    ok "GROMACS executable was not modified (${gmx_hash_after})."
+  fi
+  canonical="$(plumed_patch_canonical_dir)"
+  if [[ "$(abspath "${PATCH_UPDATE_BUNDLE}")" != "$(abspath "${canonical}")" ]]; then copy_plumed_patch_bundle_atomic "${PATCH_UPDATE_BUNDLE}"; fi
+  cleanup_prepared_plumed_patch_bundle
+  printf '%s\n' "${PATCH_UPDATE_MANIFEST_SHA256}" > "${INSTALL_ROOT}/.installer_plumed_patch_manifest_sha256"
+  printf '%s\n' "$(wc -l < "${canonical}/PATCHFILES.sha256" | tr -d ' ')" > "${INSTALL_ROOT}/.installer_plumed_patch_file_count"
+  local final_kernel_hash="$(sha256_file "${PLUMED_KERNEL}")"
+  write_plumed_patch_installed_state "${PATCH_UPDATE_MANIFEST_SHA256}" "${final_kernel_hash}" "${PATCH_UPDATE_COMMIT}" \
+    || warn "Could not write the PLUMED patch installed-state marker; a repeated update will rebuild safely."
+  echo "status=success" >> "${PATCH_UPDATE_BACKUP_DIR}/backup-info.txt"
+  PATCH_UPDATE_ACTIVE=0
+  persist_postbuild_provenance
+  append_plumed_patch_update_history "success" "manifest-driven PLUMED patch update; GROMACS unchanged"
+  write_installation_reports "plumed-patch-update"
+  section "PLUMED patch update completed successfully"
+  echo "  PLUMED commit       : ${PATCH_UPDATE_COMMIT}"
+  echo "  Manifest SHA-256    : ${PATCH_UPDATE_MANIFEST_SHA256}"
+  echo "  Patch files         : $(wc -l < "${canonical}/PATCHFILES.sha256" | tr -d ' ')"
+  echo "  GROMACS             : unchanged"
+  echo "  Backup              : ${PATCH_UPDATE_BACKUP_DIR}"
+  echo "  Log                 : ${LOG_FILE}"
+}
+
 validate_built_saxs() {
   local plumed_src="${1}" build_kernel build_plumed build_libdir info_out
   build_kernel="$(plumed_build_kernel_path "${plumed_src}")" \
@@ -4900,6 +5320,9 @@ run_saxs_update() {
   [[ -d "${INSTALL_ROOT}" ]] || die "Existing install root not found: ${INSTALL_ROOT}"
   load_persisted_install_profile
   resolve_paths
+  if [[ -f "${INSTALL_ROOT}/plumed_patch_bundle/current/PATCHFILES.sha256" ]]; then
+    die "This installation is managed by a manifest-driven PLUMED patch bundle. Use --update-plumed-patch with an updated bundle instead of --update-saxs."
+  fi
   plumed_src="${SRC}/plumed2"
   SAXS_UPDATE_TARGET="${plumed_src}/src/isdb/SAXS.cpp"
 
@@ -4914,7 +5337,7 @@ run_saxs_update() {
   fi
 
   setup_saxs_update_environment
-  ensure_saxs_update_worktree
+  ensure_plumed_update_worktree
   plumed_src="${SRC}/plumed2"
   SAXS_UPDATE_TARGET="${plumed_src}/src/isdb/SAXS.cpp"
   validate_saxs_update_install
@@ -4959,10 +5382,6 @@ run_saxs_update() {
   prepare_saxs_update_backup "${candidate}"
   SAXS_UPDATE_ACTIVE=1
 
-  # Preserve the retained PLUMED Python capability. If the current interpreter
-  # cannot execute PyPA build (for example because an unrelated namespace
-  # package called 'build' shadows it), repair only through install-root-local
-  # packages and keep that PYTHONPATH for both make and make install.
   ensure_saxs_update_python_build_module
   {
     echo "python_build_status_after=${SAXS_UPDATE_PYTHON_BUILD_STATUS}"
@@ -4983,8 +5402,6 @@ run_saxs_update() {
   touch "${SAXS_UPDATE_TARGET}"
   info "Replaced only: ${SAXS_UPDATE_TARGET}"
 
-  # Guarantee recompilation even on filesystems with coarse timestamp
-  # resolution. These are only SAXS build products, not source/configuration.
   rm -f -- \
     "${plumed_src}/src/isdb/SAXS.o" \
     "${plumed_src}/src/isdb/SAXS.cpp.o" \
@@ -5041,8 +5458,7 @@ run_saxs_update() {
     || warn "Could not write the successful installed-source/kernel state marker; a repeated update will rebuild safely."
   persist_postbuild_provenance \
     || warn "Could not refresh durable workspace/SAXS provenance after the successful update."
-  # The live scientific artifacts are now validated. Metadata failures from
-  # this point must not roll back a working kernel; report them as warnings.
+
   SAXS_UPDATE_ACTIVE=0
   append_saxs_update_history "success" "incremental PLUMED SAXS update; GROMACS unchanged" \
     || warn "Could not append SAXS update history."
@@ -5067,11 +5483,8 @@ run_saxs_update() {
   echo "  Log                 : ${LOG_FILE}"
 }
 
-
-
 compiler_version_string() {
-  # compiler_version_string <compiler-or-wrapper>
-  # Prints the first version-like token from '<cmd> --version'.
+
   local cmd="${1}" out ver
   out="$(${cmd} --version 2>/dev/null | head -n1 || true)"
   ver="$(printf '%s\n' "${out}" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)"
@@ -5079,8 +5492,7 @@ compiler_version_string() {
 }
 
 mpi_cxx_compiler_version_string() {
-  # GROMACS-only uses the normal C++ compiler. The full route prefers the
-  # compiler behind the locally built OpenMPI wrapper.
+
   local wrapper="${MPI_ROOT}/bin/mpicxx" cmd ver
   if is_gromacs_only || is_cpu_only; then
     if [[ -n "${CXX:-}" ]] && command -v "${CXX}" >/dev/null 2>&1; then
@@ -5118,9 +5530,7 @@ ensure_cmake_for_selected_gromacs() {
 }
 
 resolve_gromacs_selection() {
-  # Resolves GROMACS_VERSION, PLUMED_GROMACS_PATCH and source URLs.
-  # CUDA mode preserves the historical selection rule. CPU-only mode needs no
-  # CUDA version and selects from the host C/C++ compiler alone.
+
   local ver major reason=""
   if [[ "${GROMACS_VERSION}" == "auto" ]]; then
     ver="$(mpi_cxx_compiler_version_string || true)"
@@ -5657,9 +6067,7 @@ run_stage() {
 }
 
 mpi_run_one() {
-  # Run one process through the selected external MPI launcher. This avoids
-  # calling MPI-linked CLI tools bare on systems where MPI_Init requires the
-  # resource-manager/launcher context. A timeout prevents finalization hangs.
+
   [[ -x "${MPI_ROOT}/bin/mpirun" ]] || return 127
   if command -v timeout >/dev/null 2>&1; then
     timeout "${MPI_RUNTIME_TIMEOUT}" "${MPI_ROOT}/bin/mpirun" -np 1 "$@"
@@ -5668,16 +6076,10 @@ mpi_run_one() {
   fi
 }
 
-###############################################################################
-# Final checks
-###############################################################################
 final_checks() {
   section "Final PLUMED checks"
   command -v plumed >/dev/null 2>&1 || die "plumed not found on PATH after build."
 
-  # Avoid bare MPI initialization during feature/configuration checks. Some HPC
-  # MPI stacks require launcher/resource-manager context even for simple CLI
-  # queries. Build-time capabilities are available through `plumed config`.
   plumed --no-mpi --is-installed
   if is_cpu_only; then
     if plumed --no-mpi config has mpi >/dev/null 2>&1; then
@@ -5952,10 +6354,7 @@ postflight_stack_checks() {
 generate_activate_script() {
   local out="${INSTALL_ROOT}/activate.sh"
   local cmake_activation_block=""
-  # CMake is a build-time tool.  In split-workspace mode it normally lives in
-  # durable work storage (for example $HOME), so runtime activation must not
-  # depend on it.  Preserve the legacy activation behavior when no --work-dir
-  # is used.
+
   if [[ "${SPLIT_LAYOUT}" -eq 0 && -n "${CMAKE_ROOT:-}" && -x "${CMAKE_ROOT}/bin/cmake" ]]; then
     cmake_activation_block="export CMAKE_ROOT=\"${CMAKE_ROOT}\"
 export PATH=\"\${CMAKE_ROOT}/bin:\${PATH}\""
@@ -5964,15 +6363,11 @@ export PATH=\"\${CMAKE_ROOT}/bin:\${PATH}\""
   if is_cpu_only; then
     if is_gromacs_only; then
       cat > "${out}" <<EOF
-#!/usr/bin/env bash
-# Auto-generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date).
-# CPU-only standalone GROMACS with built-in thread-MPI: source "${out}"
 
 ${cmake_activation_block}
 export FFTW_ROOT="${FFTW_ROOT}"
 export GMX_ROOT="${GMX_ROOT}"
 
-# Clear GPU/full-stack variables inherited from another activated environment.
 unset CUDA_HOME CUDA_ROOT CUDACXX CUDAHOSTCXX PLUMED_PREFIX PLUMED_ROOT PLUMED_KERNEL AF_ROOT MPI_ROOT BOOST_ROOT FMT_ROOT SPDLOG_ROOT 2>/dev/null || true
 
 export GROMACS_DIR="\${GMX_ROOT}"
@@ -5992,9 +6387,6 @@ echo "Use 'gmx' (not gmx_mpi). This build has no GPU/CUDA support."
 EOF
     else
       cat > "${out}" <<EOF
-#!/usr/bin/env bash
-# Auto-generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date).
-# CPU-only PLUMED + patched GROMACS with built-in thread-MPI: source "${out}"
 
 ${cmake_activation_block}
 export FFTW_ROOT="${FFTW_ROOT}"
@@ -6003,7 +6395,6 @@ export PLUMED_PREFIX="${PLUMED_ROOT}"
 export PLUMED_ROOT="\${PLUMED_PREFIX}/lib/plumed"
 export PLUMED_KERNEL="\${PLUMED_PREFIX}/lib/libplumedKernel.so"
 
-# Clear GPU/external-MPI variables inherited from another activated environment.
 unset CUDA_HOME CUDA_ROOT CUDACXX CUDAHOSTCXX AF_ROOT MPI_ROOT BOOST_ROOT FMT_ROOT SPDLOG_ROOT 2>/dev/null || true
 
 export GROMACS_DIR="\${GMX_ROOT}"
@@ -6034,9 +6425,6 @@ export GMX_ENABLE_DIRECT_GPU_COMM="${GMX_ENABLE_DIRECT_GPU_COMM:-1}"'
         ;;
     esac
     cat > "${out}" <<EOF
-#!/usr/bin/env bash
-# Auto-generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date).
-# Standalone CUDA GROMACS with built-in thread-MPI: source "${out}"
 
 export CUDA_HOME="${CUDA_HOME}"
 export CUDA_ROOT="\${CUDA_HOME}"
@@ -6060,9 +6448,6 @@ echo "Use 'gmx' (not gmx_mpi). GPU update is automatic when supported; use '-upd
 EOF
   else
     cat > "${out}" <<EOF
-#!/usr/bin/env bash
-# Auto-generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date).
-# Activate the '${NAME}' CUDA/PLUMED/GROMACS build environment: source "${out}"
 
 export CUDA_HOME="${CUDA_HOME}"
 export CUDA_ROOT="\${CUDA_HOME}"
@@ -6139,9 +6524,6 @@ integrate_shell_rc() {
   fi
 }
 
-###############################################################################
-# Reporting
-###############################################################################
 print_config() {
   section "Build configuration"
   printf '  %-22s : %s
@@ -6227,6 +6609,8 @@ print_config() {
       printf '  %-22s : %s
 ' "SAXS override" "disabled; upstream PLUMED only (CPU bookmark)"
     else
+      printf '  %-22s : %s
+' "PLUMED patch bundle" "${PLUMED_PATCH_BUNDLE:-not-selected}"
       printf '  %-22s : %s
 ' "PLUMED patch dir" "$(resolve_plumed_patch_dir 2>/dev/null || printf '%s' "${PLUMED_PATCH_DIR}")"
       printf '  %-22s : %s
@@ -6325,6 +6709,12 @@ print_status() {
 ' "SAXS source SHA-256" "${status_saxs:-missing}"
     printf '  %-22s : %s
 ' "Kernel SHA-256" "${status_kernel:-missing}"
+    if [[ -s "${INSTALL_ROOT}/.installer_plumed_patch_manifest_sha256" ]]; then
+      printf '  %-22s : %s
+' "Patch manifest SHA" "$(head -n1 "${INSTALL_ROOT}/.installer_plumed_patch_manifest_sha256")"
+      printf '  %-22s : %s
+' "Patch file count" "$(head -n1 "${INSTALL_ROOT}/.installer_plumed_patch_file_count" 2>/dev/null || true)"
+    fi
     if is_cpu_only; then
       printf '  %-22s : %s
 ' "SAXS update support" "intentionally disabled for CPU profile"
@@ -6341,9 +6731,7 @@ print_status() {
 }
 
 finalize_installation() {
-  # finalize_installation <last-action>
-  # This phase is deliberately separate from compilation so scheduler timeouts
-  # after make install can be recovered with --finalize-only.
+
   local action="${1:-build}"
 
   if is_full_stack; then
@@ -6435,9 +6823,12 @@ main() {
   resolve_source_cache_path
   prepare_offline_cmake_archive
 
-  # SAXS updates intentionally remain tied to the validated CUDA/ArrayFire
-  # installation. setup_saxs_update_environment also checks the persisted
-  # accelerator marker so a CPU install cannot be updated accidentally.
+  if [[ "${UPDATE_PLUMED_PATCH}" -eq 1 ]]; then
+    resolve_paths
+    run_plumed_patch_update
+    return 0
+  fi
+
   if [[ "${UPDATE_SAXS}" -eq 1 ]]; then
     resolve_paths
     run_saxs_update
@@ -6445,9 +6836,7 @@ main() {
   fi
 
   if [[ "${FINALIZE_ONLY}" -eq 1 ]]; then
-    # --name is mandatory for this route, so resolve_paths does not need CUDA
-    # to construct the installation name. Restore persisted route/MPI metadata
-    # before reconstructing the runtime environment.
+
     resolve_paths
     [[ -d "${INSTALL_ROOT}" ]] || die "Existing installation not found for --finalize-only: ${INSTALL_ROOT}"
     load_persisted_install_profile
@@ -6499,16 +6888,13 @@ main() {
     export CUDA_ROOT="${CUDA_HOME}"
     export CUDACXX="${CUDA_HOME}/bin/nvcc"
   elif [[ "${PREFETCH}" -eq 1 && "${GROMACS_VERSION}" != "auto" ]]; then
-    # Source-only prefetch with an explicitly selected GROMACS version does not
-    # compile CUDA code and therefore must not require a CUDA toolkit or GPU.
+
     CUDA_HOME=""
     CUDA_VERSION="not-required-for-prefetch"
     CUDA_ARCHS="not-required-for-prefetch"
     unset CUDA_ROOT CUDACXX 2>/dev/null || true
   else
-    # Normal builds, finalization, and CUDA prefetch with GROMACS_VERSION=auto
-    # retain the established CUDA detection policy because auto-selection of
-    # GROMACS 2025.x vs 2024.6 depends on the target CUDA version.
+
     detect_cuda
   fi
   resolve_paths
@@ -6521,15 +6907,10 @@ main() {
 
   resolve_build_compilers
 
-  # Prefetch is a source-acquisition-only operation. Resolve the same GROMACS
-  # selection as a build, populate/verify the shared cache, then exit without
-  # touching <dir>/<name>.
   if [[ "${PREFETCH}" -eq 1 ]]; then
-    # Source acquisition is architecture-independent. Never probe a GPU in
-    # prefetch mode; login/data-transfer nodes frequently have no GPU device.
+
     if is_cuda_backend; then CUDA_ARCHS="not-required-for-prefetch"; else CUDA_ARCHS="not-applicable"; fi
-    # Prefetch also does not need an operational MPI installation. Keep only a
-    # descriptive prefix for configuration reporting and source-plan selection.
+
     if using_system_mpi; then
       MPI_ROOT="${MPI_PREFIX:-not-required-for-prefetch}"
     else
@@ -6552,9 +6933,7 @@ main() {
   fi
 
   if [[ "${OFFLINE}" -eq 1 ]]; then
-    # GROMACS_VERSION must be resolved before we can know the exact required
-    # cache artifact set. The final compiler compatibility check still occurs
-    # again after environment setup, as in normal v34 builds.
+
     setup_environment
     resolve_gromacs_selection
     verify_source_cache
@@ -6571,7 +6950,7 @@ main() {
     info "Logging to ${LOG_FILE}"
 
     conda deactivate 2>/dev/null || true
-    # conda/module hooks can rewrite compiler variables. Restore caller intent.
+
     resolve_build_compilers
 
     install_private_cmake
@@ -6644,7 +7023,11 @@ main() {
 on_err() {
   local rc=$?
   echo
-  if [[ "${SAXS_UPDATE_ACTIVE:-0}" -eq 1 ]]; then
+  if [[ "${PATCH_UPDATE_ACTIVE:-0}" -eq 1 ]]; then
+    handle_failed_plumed_patch_update "${rc}" "operation failed" "${BASH_LINENO[0]}"
+  elif [[ "${UPDATE_PLUMED_PATCH:-0}" -eq 1 ]]; then
+    cleanup_prepared_plumed_patch_bundle
+  elif [[ "${SAXS_UPDATE_ACTIVE:-0}" -eq 1 ]]; then
     handle_failed_saxs_update "${rc}" "operation failed" "${BASH_LINENO[0]}"
   fi
   err "${CURRENT_OPERATION^} failed at line ${BASH_LINENO[0]} (exit ${rc})."
